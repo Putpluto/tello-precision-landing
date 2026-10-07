@@ -1,4 +1,10 @@
 # Tested with Python 3.14, opencv-python 5.0, numpy 2.5, djitellopy 2.5.0.
 opencv-python>=4.7        # 4.7+ for the cv2.aruco.ArucoDetector API
 numpy>=1.24
-djitellopy==2.5.0         # hands out RGB frames - tello_pose.Frames converts
+djitellopy==2.5.0         # hands out RGB frames - tello_io converts
+pillow>=9                 # GUI images (it falls back without), make_targets.py
+reportlab>=3.6            # make_targets.py: the printable PDFs
+
+# Optional:
+#   rerun-sdk             view_room_3d.py (the GUI's own 3D views need nothing extra)
+#   pytest                python -m pytest tests  (no drone needed)

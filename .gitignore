@@ -13,7 +13,6 @@ recordings/
 *.zip
 *.rar
 *.pptx
-# simulator (removed from the project)
+# simulator (removed from the project; tests/sim.py is the test double)
 tello_sim.py
 sim_eval.py
-tests/

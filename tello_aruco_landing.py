@@ -2,7 +2,8 @@
 Visit waypoint markers, then search for the 4-marker ArUco board and land
 on the pad in front of it.
 
-    python tello_aruco_landing.py --view                    # marker 4, right to 5, left to the board, land
+    python tello_aruco_landing.py --view                    # markers 4 5 6 7, then the board, land
+    python tello_aruco_landing.py --view --turns R R L R L  # which way to turn for each search
     python tello_aruco_landing.py --view --waypoints        # straight to the board and land
     python tello_aruco_landing.py --view --hold             # stop 70 cm from the board, don't land
     python tello_aruco_landing.py --view --log run.csv
@@ -19,7 +20,14 @@ on the pad in front of it.
       -> LAND
 
 Each search only turns on the spot, so the next marker (or the board) must
-be visible from where the drone stops at the previous one.
+be visible from where the drone stops at the previous one - at the height
+it stops at, too: it flies level with each marker's centre, and the camera
+sees only about +-21 deg up and down.
+
+The mission itself - states, standoffs, tolerances, timeouts, gains - is
+landing_control.Mission / MissionConfig, the same code the GUI's Mission
+tab runs. This file is the I/O around it: the drone, the video, the
+localization of whichever target the mission wants, the log, the window.
 
 Localization is tello_pose.py's, the same as the GUI: both mirror-image
 poses of the target (PoseEstimator), the real one picked by BoardTracker
@@ -36,6 +44,7 @@ exit. There is no obstacle sensing: keep the paths clear.
 
 import argparse
 import csv
+import dataclasses
 import math
 import threading
 import time
@@ -44,125 +53,60 @@ import cv2
 import numpy as np
 
 from board_config import load_board
-from tello_io import FrameGrabber, open_drone
+from landing_control import BOARD, Mission, Obs, for_board, target_name
+from tello_io import FrameGrabber, open_drone, put_text
 from tello_map import LocalizationMap
 from tello_pose import (BoardGeometry, BoardTracker, PoseEstimator, PoseFilter,
                         load_calibration)
 
 # ----------------------------------------------------------------------
-# Settings (cm, degrees, seconds)
+# The route
 # ----------------------------------------------------------------------
 
-# The route: marker 4, marker 5, then the board. While searching for each
-# target the drone turns this way on the spot: +1 = right (clockwise),
-# -1 = left. Find 4 (turning right), turn right to find 5, turn left to
-# find the board.
-WAYPOINTS = (4, 5)
-SEARCH_TURN = {4: +1, 5: +1, "board": -1}
+# Waypoint markers in the order they are visited; the board comes last.
+# While searching for each target the drone turns this way on the spot:
+# +1 = right (clockwise), -1 = left. A full turn finds it either way - the
+# right direction only makes it quicker. Set them for your room, here or
+# with --turns.
+WAYPOINTS = (4, 5, 6, 7)
+SEARCH_TURN = {4: +1, 5: +1, 6: +1, 7: +1, BOARD: -1}
+WAYPOINT_MARKER_M = 0.150   # print/room_marker_*_A4.pdf
 
-WAYPOINT_CM = 100.0         # stop this far in front of each waypoint marker
-WAYPOINT_HOVER_S = 2.0      # and hover there this long
-FAR_CM = 150.0              # first stop in front of the board
-NEAR_CM = 70.0              # last stop before the hop
-HEIGHT_CM = 0.0             # fly level with the centre of the marker / board
+# I/O timing. Everything about how the route is flown (standoffs, hover
+# time, tolerances, timeouts, gains) is landing_control.MissionConfig.
 RATE_HZ = 15.0
 VIDEO_DELAY_S = 0.25        # the video lags; positions are predicted across it
-
-# settled = every error (cm, deg) inside these, moving slower than speed (cm/s), for SETTLE_S
-TOL_WAYPOINT = dict(fwd=15, lat=12, up=15, yaw=8, speed=20)
-TOL_FAR = dict(fwd=15, lat=12, up=15, yaw=8, speed=20)
-TOL_NEAR = dict(fwd=5, lat=3.5, up=6, yaw=4, speed=7)
-SETTLE_S = 0.8
-
-SEARCH_RC = 22              # how fast to turn while searching
-SEARCH_MAX_S = 25.0         # a bit more than one full turn
-LOST_S = 1.2                # target out of view this long -> search again
-CLOSE_MAX_S = 40.0          # can't settle at NEAR -> land where it is
-GOTO_MAX_S = 40.0           # can't settle at a waypoint -> land where it is
-MISSION_MAX_S = 120.0       # plus WAYPOINT_EXTRA_S per waypoint
-WAYPOINT_EXTRA_S = 45.0
-BATTERY_MIN = 15
 AFTER_LAND_S = 5.0          # keep recording this long after touching down
-HOP_SPEED = 30              # cm/s
-HOP_MAX_CM = 95.0
-CAMERA_AHEAD_CM = 4.0       # the lens sits this far in front of the drone's centre
-WAYPOINT_MARKER_M = 0.150   # print/room_marker_*_A4.pdf
 MAP_SIZE = (564, 720)       # the map beside the 960x720 camera view
 
-# per axis: kp (rc per cm, per deg for yaw), kd (rc per cm/s), ki (rc per cm*s), limit (rc)
-GAINS = dict(fwd=(0.55, 0.30, 0.10, 30), lat=(0.55, 0.30, 0.10, 25),
-             up=(0.60, 0.20, 0.10, 25), yaw=(0.90, 0.00, 0.00, 30))
-SLEW = 10                   # max rc change per step: the Tello dislikes jumps
+# One row per control step. The columns shared with the GUI's recordings
+# (tello_gui.Recorder) have the same names, so tello_map.py replays both.
+LOG_COLS = ["t", "target", "state", "px", "py", "pz", "vx", "vy", "vz",
+            "yaw", "resolved", "source", "ambiguity", "rms", "n",
+            "raw_x", "raw_y", "raw_z", "e_fwd", "e_lat", "e_up", "e_yaw",
+            "a", "b", "c", "d", "hop_fwd", "hop_left",
+            "bat", "h", "tof", "imu_pitch", "imu_roll", "imu_yaw", "vgx", "vgy", "vgz",
+            "note"]
 
 
-# ----------------------------------------------------------------------
-# Control
-# ----------------------------------------------------------------------
-
-class Axis:
-    """PD (+ a small I to cancel steady drift once close) for one rc channel."""
-
-    def __init__(self, kp, kd, ki, limit):
-        self.kp, self.kd, self.ki, self.limit = kp, kd, ki, limit
-        self.i = 0.0
-        self.out = 0.0
-
-    def step(self, err, vel, dt):
-        # vel is along the same axis as err: moving toward the target makes
-        # err*vel > 0. Integrate only near the target and when not closing in.
-        if self.ki and abs(err) < 30 and err * vel <= 2 * abs(err):
-            self.i = float(np.clip(self.i + self.ki * err * dt, -12, 12))
-        u = np.clip(self.kp * err - self.kd * vel + self.i, -self.limit, self.limit)
-        self.out = float(np.clip(u, self.out - SLEW, self.out + SLEW))
-        return self.out
-
-    def reset(self):
-        self.i = self.out = 0.0
-
-
-def body_axes(R):
-    """The drone's forward and right directions, flattened onto the floor,
-    from the camera axes R (target frame)."""
-    fwd, right = R[:, 2].copy(), R[:, 0].copy()
-    fwd[1] = right[1] = 0.0
-    return fwd / np.linalg.norm(fwd), right / np.linalg.norm(right)
-
-
-class Controller:
-    """Fly to `target` with the nose pointed at the centre of the marker/board."""
-
-    def __init__(self):
-        self.axes = {k: Axis(*g) for k, g in GAINS.items()}
-
-    def reset(self):
-        for a in self.axes.values():
-            a.reset()
-
-    def step(self, p, v, R, target, use_lateral, dt):
-        fwd, right = body_axes(R)
-        e, aim = target - p, np.array([0.0, HEIGHT_CM, 0.0]) - p
-        err = dict(fwd=e @ fwd, lat=e @ right, up=e[1],
-                   yaw=math.degrees(math.atan2(aim @ right, aim @ fwd)))
-        vel = dict(fwd=v @ fwd, lat=v @ right, up=v[1])
-        if use_lateral:
-            a = self.axes["lat"].step(err["lat"], vel["lat"], dt)
-        else:
-            # mirror pose possible: the sign of the sideways error is unknown
-            self.axes["lat"].i = 0.0
-            a = self.axes["lat"].step(0.0, 0.0, dt)
-        b = self.axes["fwd"].step(err["fwd"], vel["fwd"], dt)
-        c = self.axes["up"].step(err["up"], vel["up"], dt)
-        d = self.axes["yaw"].step(err["yaw"], 0.0, dt)
-        err["speed"] = float(np.linalg.norm(v if use_lateral else v * [0, 1, 1]))
-        return tuple(int(round(x)) for x in (a, b, c, d)), err
-
-
-def hop_vector(p, R, pad_out_cm):
-    """(forward, right) cm the drone's centre must move to be over the pad."""
-    fwd, right = body_axes(R)
-    centre = p - fwd * CAMERA_AHEAD_CM
-    d = np.array([0.0, centre[1], pad_out_cm]) - centre
-    return float(d @ fwd), float(d @ right)
+def parse_turns(turns, waypoints):
+    """'R R L R L' (or a list of them) -> {target: +1/-1}: one per waypoint
+    marker in route order, then one for the board. Empty -> SEARCH_TURN,
+    and right for any marker it does not list."""
+    items = turns.replace(",", " ").split() if isinstance(turns, str) else list(turns or [])
+    targets = [int(w) for w in waypoints] + [BOARD]
+    if not items:
+        return {t: SEARCH_TURN.get(t, 1) for t in targets}
+    if len(items) != len(targets):
+        raise ValueError(f"need {len(targets)} turns (one per waypoint marker, then the "
+                         f"board), got {len(items)}")
+    out = {}
+    for t, s in zip(targets, items):
+        s = str(s).strip().upper()
+        if s not in ("R", "L", "RIGHT", "LEFT"):
+            raise ValueError(f"turn {s!r}: use R or L")
+        out[t] = 1 if s.startswith("R") else -1
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -195,50 +139,68 @@ def waypoint_geometry(board, marker_id, marker_m=WAYPOINT_MARKER_M):
 # ----------------------------------------------------------------------
 
 class Lander:
-    """The whole mission. The command line runs it with an OpenCV window
-    (view=True); tello_gui.py runs it in a thread, gets each rendered view
-    through on_frame and each message through on_note, asks it to stop with
-    the `stop` Event, and keeps the connection afterwards (disconnect=False)."""
+    """Flies a landing_control.Mission on a real drone. The command line
+    runs it with an OpenCV window (view=True); tello_gui.py runs it in a
+    thread, reads each rendered view from `latest` (or gets it through
+    on_frame) and each message through on_note, asks it to stop with the
+    `stop` Event, and keeps the connection afterwards (disconnect=False).
 
-    def __init__(self, drone, K, dist, waypoints=(), hold=False, view=False, log=None,
-                 record=None, on_frame=None, on_note=None, stop=None, disconnect=True,
-                 airborne=None, board=None, waypoint_marker_m=WAYPOINT_MARKER_M,
-                 now=time.monotonic, sleep=time.sleep):
+    cfg: a MissionConfig (default: landing_control.for_board(board)).
+    display: render the camera + map view on its own thread - default on
+    when something shows or records it."""
+
+    def __init__(self, drone, K, dist, waypoints=(), search_turn=None, hold=False, view=False,
+                 log=None, record=None, on_frame=None, on_note=None, stop=None, disconnect=True,
+                 airborne=None, board=None, waypoint_marker_m=WAYPOINT_MARKER_M, cfg=None,
+                 display=None, now=time.monotonic, sleep=time.sleep):
         self.drone = drone
         board = board or load_board()
-        self.pad_out_cm = board.pad_out_m * 100.0
-        self.perc = {"board": Perception(K, dist, board, (("FAR", FAR_CM), ("NEAR", NEAR_CM)))}
+        cfg = cfg or for_board(board)[0]
+        self.cfg = dataclasses.replace(cfg, hold=hold or cfg.hold)
+        turns = parse_turns("", waypoints) if search_turn is None else search_turn
+        self.mission = Mission(self.cfg, waypoints=waypoints, search_turn=turns)
+        self.perc = {BOARD: Perception(K, dist, board, (("FAR", self.cfg.standoff_far),
+                                                        ("NEAR", self.cfg.standoff_near)))}
         for w in waypoints:
             self.perc[int(w)] = Perception(K, dist, waypoint_geometry(board, w, waypoint_marker_m),
-                                           (("STOP", WAYPOINT_CM),))
+                                           (("STOP", self.cfg.waypoint_standoff),))
         # None: ask djitellopy. The GUI says, since it takes off with raw commands.
         self.airborne_at_start = airborne
         self.on_frame, self.on_note = on_frame, on_note
         self.stop, self.disconnect = stop, disconnect
-        self.targets = [int(w) for w in waypoints] + ["board"]
         self.hold, self.view = hold, view
+        self.display = (view or bool(record) or on_frame is not None) if display is None else display
         self.now, self.sleep = now, sleep
-        self.max_s = MISSION_MAX_S + WAYPOINT_EXTRA_S * len(waypoints)
         self.frames = FrameGrabber(drone)
-        self.ctrl = Controller()
-        self.pose = None                     # latest pose (orientation, resolved)
-        self.det = None
+        self._target = None                  # whose track self.pose belongs to
+        self.pose = None                     # latest pose of the target (orientation, resolved)
+        self.raw = None                      # this step's pose, before filtering
+        self.servo = None                    # this step's errors (landing_control.ServoOut)
+        self.v = None
+        self.det = (None, None)
         self.frame = None
+        self.phase = None                    # TAKEOFF / HOP / LANDING / LANDED: waiting on the drone
+        self.telem = {}
+        self.battery, self.imu_yaw, self.rc = None, None, (0, 0, 0, 0)
         self.log = None
         if log:
             self.logf = open(log, "w", newline="")
             self.log = csv.writer(self.logf)
-            self.log.writerow(["t", "target", "state", "x", "y", "z", "vx", "vy", "vz",
-                               "yaw", "resolved", "rc_right", "rc_fwd", "rc_up", "rc_yaw",
-                               "battery", "note"])
+            self.log.writerow(LOG_COLS)
         self.record = record
         self.video = None                    # opened in run(): what the window shows, as .mp4
         self.reason = ""
         self.warned_upside_down = set()
+        self.t0 = now()
+        self.note = ""
 
     @property
     def target(self):
-        return self.targets[0]
+        return self.mission.target
+
+    @property
+    def state(self):
+        return self.phase or self.mission.state.value
 
     def say(self, msg):
         line = f"[{self.now() - self.t0:6.1f}s] {msg}"
@@ -247,45 +209,35 @@ class Lander:
         if self.on_note:
             self.on_note(line)
 
-    def goto(self, state, msg=None):
-        self.say(msg or f"-> {state}")
-        self.state = state
-        self.t_state = self.now()
-        self.t_settled = None
-        self.ctrl.reset()
-
-    def next_target(self):
-        """Done with this waypoint: forget its track and search for the next one."""
-        done = self.targets.pop(0)
-        self.pose = None
-        self.turn = SEARCH_TURN.get(self.target, 1)
-        name = "the board" if self.target == "board" else f"marker {self.target}"
-        side = "right" if self.turn > 0 else "left"
-        self.goto("SEARCH", f"marker {done} done -> turn {side}, SEARCH for {name}")
-
-    def settled(self, err, tol, scale=1.0):
-        ok = all(abs(err[k]) < tol[k] * scale for k in tol)
-        if not ok:
-            self.t_settled = None
-            return False
-        if self.t_settled is None:
-            self.t_settled = self.now()
-        return self.now() - self.t_settled >= SETTLE_S
-
     # -- one control step -------------------------------------------------
-    def observe(self):
-        """New frame -> pose of the current target -> track. Returns the
-        position predicted to now, or None if the target hasn't been seen
-        recently."""
-        now = self.now()
-        perc = self.perc[self.target]
+    def read_state(self):
+        """The drone's state packet: battery, and the IMU yaw that helps
+        pick the real pose over its mirror. Kept whole for the log."""
+        try:
+            st = self.drone.get_current_state() or {}
+        except Exception:
+            st = {}
+        self.telem = st
+        self.battery = st.get("bat", self.battery)
+        self.imu_yaw = st.get("yaw")
+
+    def observe(self, now):
+        """New frame -> pose of the mission's current target -> track.
+        Returns the position predicted to now, or None if the target
+        hasn't been seen recently."""
+        target = self.mission.target
+        if target != self._target:           # the route moved on: that track starts fresh
+            self._target, self.pose = target, None
+        perc = self.perc[target]
         frame, new = self.frames.grab()
+        self.raw = None
         if new:
             self.frame = frame
             self.det = perc.est.detect(frame)[:2]
             t_cap = now - VIDEO_DELAY_S
             pose = perc.tracker.update(detection=self.det, t_capture=t_cap,
                                        imu_yaw=self.imu_yaw)
+            self.raw = pose
             if pose is not None:
                 self.pose = pose
                 perc.filt.update(pose, now=t_cap)
@@ -293,112 +245,27 @@ class Lander:
                 if p is not None:
                     perc.trail = (perc.trail + [tuple(p)])[-300:]
             elif (perc.est.upside_down(self.det)
-                  and self.target not in self.warned_upside_down):
-                self.warned_upside_down.add(self.target)
-                what = "BOARD" if self.target == "board" else f"MARKER {self.target}"
+                  and target not in self.warned_upside_down):
+                self.warned_upside_down.add(target)
+                what = "BOARD" if target == BOARD else f"MARKER {target}"
                 self.say(f"!! THE {what} IS UPSIDE DOWN - mount it with the TOP mark up"
-                         + (" (id 0 top left)" if self.target == "board" else "")
+                         + (" (id 0 top left)" if target == BOARD else "")
                          + ". Ignoring it until then.")
         if self.pose is not None and perc.filt.fresh(now - VIDEO_DELAY_S):
             self.v = perc.filt.velocity()
             return perc.filt.predict(now)
+        self.v = None
         return None
-
-    def step(self, p, battery, dt):
-        """The state machine. Returns (rc, action) - action None, 'hop' or 'land'."""
-        now = self.now()
-        if now - self.t0 > self.max_s:
-            return self.finish("mission took too long")
-        if battery is not None and battery < BATTERY_MIN:
-            return self.finish(f"battery {battery}%")
-        seen = p is not None
-        if seen:
-            self.t_seen = now
-
-        if self.state == "SEARCH":
-            if seen:
-                if self.target == "board":
-                    self.goto("APPROACH", "board found -> APPROACH")
-                else:
-                    self.goto("GOTO", f"marker {self.target} found -> GOTO")
-                return (0, 0, 0, 0), None
-            if now - self.t_state > SEARCH_MAX_S:
-                what = "board" if self.target == "board" else f"marker {self.target}"
-                return self.finish(f"{what} not found")
-            return (0, 0, 0, self.turn * SEARCH_RC), None
-
-        if self.state in ("GOTO", "HOVER", "APPROACH", "CLOSE", "HOLD"):
-            if not seen:
-                if self.state == "HOVER" and now - self.t_state >= WAYPOINT_HOVER_S:
-                    self.next_target()
-                elif now - self.t_seen > LOST_S and self.state != "HOVER":
-                    self.goto("SEARCH", "lost it -> SEARCH")
-                return (0, 0, 0, 0), None
-            stand = {"GOTO": WAYPOINT_CM, "HOVER": WAYPOINT_CM,
-                     "APPROACH": FAR_CM}.get(self.state, NEAR_CM)
-            target = np.array([0.0, HEIGHT_CM, stand])
-            rc, err = self.ctrl.step(p, self.v, self.pose.R_level_cam, target,
-                                     self.pose.resolved, dt)
-            self.err = err
-            if abs(err["yaw"]) > 2:
-                self.turn = 1 if err["yaw"] > 0 else -1    # if lost, turn this way
-            in_state = now - self.t_state
-            if self.state == "GOTO":
-                if self.settled(err, TOL_WAYPOINT):
-                    self.goto("HOVER", f"at marker {self.target} -> HOVER "
-                                       f"{WAYPOINT_HOVER_S:.0f} s")
-                elif in_state > GOTO_MAX_S:
-                    return self.finish(f"could not settle at marker {self.target}")
-            elif self.state == "HOVER":
-                if in_state >= WAYPOINT_HOVER_S:
-                    self.next_target()
-                    return (0, 0, 0, 0), None
-            elif self.state == "APPROACH" and self.settled(err, TOL_FAR):
-                self.goto("CLOSE", "settled at FAR -> CLOSE")
-            elif self.state == "CLOSE":
-                # after 12 s, loosen the tolerances a little (up to 1.6x)
-                scale = 1 + min(max(in_state - 12, 0) / 10, 0.6)
-                if self.settled(err, TOL_NEAR, scale):
-                    self.goto("HOLD" if self.hold else "HOP",
-                              "settled at NEAR -> " + ("HOLD" if self.hold else "HOP"))
-                elif in_state > CLOSE_MAX_S:
-                    return self.finish("could not settle at NEAR")
-            return rc, None
-
-        if self.state == "HOP":
-            if not seen:
-                return self.finish("board lost just before the hop")
-            fwd, right = hop_vector(p, self.pose.R_level_cam, self.pad_out_cm)
-            if not self.pose.resolved:
-                right = 0.0     # side unknown, but it settled within 3.5 cm of the axis
-            if not (-5 <= fwd <= HOP_MAX_CM and abs(right) <= 40):
-                return self.finish(f"hop ({fwd:.0f}, {right:.0f}) cm looks wrong")
-            self.reason = "landed on the pad"
-            self.state = "LAND"
-            if max(abs(fwd), abs(right)) < 20:          # 'go' won't do under 20 cm
-                self.say(f"already over the pad ({fwd:.0f}, {right:.0f}) cm - land")
-                return (0, 0, 0, 0), "land"
-            self.say(f"HOP forward {fwd:.0f} cm, right {right:.0f} cm")
-            self.hop = (int(round(fwd)), int(round(-right)))   # go_xyz: x fwd, y left
-            return (0, 0, 0, 0), "hop"
-        return (0, 0, 0, 0), None
-
-    def finish(self, why):
-        self.reason = why
-        self.say(f"LAND: {why}")
-        self.state = "LAND"
-        return (0, 0, 0, 0), "land"
 
     # -- the loop ---------------------------------------------------------
     def run(self):
-        drone = self.drone
-        self.t0 = self.t_state = self.t_seen = self.now()
-        self.state, self.t_settled, self.note, self.err = "SEARCH", None, "", None
-        self.turn = SEARCH_TURN.get(self.target, 1)
-        self.v, self.imu_yaw = np.zeros(3), None
+        drone, m = self.drone, self.mission
+        self.t0 = self.now()
+        self.imu_yaw = None
         self.rc, self.battery = (0, 0, 0, 0), drone.get_battery()
         self.say(f"battery {self.battery}%   route: " + " -> ".join(
-            "board" if t == "board" else f"marker {t}" for t in self.targets))
+            f"{target_name(t)} ({'R' if m.search_turn.get(t, 1) > 0 else 'L'})"
+            for t in m.targets))
         if self.record:
             self.video = cv2.VideoWriter(self.record, cv2.VideoWriter_fourcc(*"mp4v"),
                                          RATE_HZ, (960 + MAP_SIZE[0], 720))
@@ -410,58 +277,54 @@ class Lander:
         self.blocked = False
         self.latest = None
         self.done = threading.Event()
-        display = threading.Thread(target=self._display_loop, daemon=True)
-        display.start()
+        display = None
+        if self.display:
+            display = threading.Thread(target=self._display_loop, daemon=True)
+            display.start()
         airborne = landed = False
         try:
             flying = (getattr(drone, "is_flying", False) if self.airborne_at_start is None
                       else self.airborne_at_start)
             if not flying:
-                self.state, self.blocked = "TAKEOFF", True
+                self.phase, self.blocked = "TAKEOFF", True
                 drone.takeoff()
-                self.state, self.blocked = "SEARCH", False
+                self.phase, self.blocked = None, False
             airborne = True
-            self.t_state = self.now()
-            t_prev = self.now()
             while True:
                 t = self.now()
-                dt = min(max(t - t_prev, 0.01), 0.3)
-                t_prev = t
-                try:
-                    st = drone.get_current_state() or {}
-                    self.battery = st.get("bat", self.battery)
-                    self.imu_yaw = st.get("yaw")      # helps pick the real pose over its mirror
-                except Exception:
-                    pass
+                self.read_state()
                 self.note = ""
-                p = self.observe()
+                p = self.observe(t)
+                obs = Obs(t=t, p=p, v=self.v, pose=self.pose if p is not None else None,
+                          battery=self.battery)
                 if self.stop is not None and self.stop.is_set():
-                    rc, action = self.finish("stopped by hand")
+                    cmd = m.abort(t, "stopped by hand")
                 else:
-                    rc, action = self.step(p, self.battery, dt)
-                self.rc = rc
-                if action == "hop":
+                    cmd = m.step(obs)
+                if cmd.note:
+                    self.say(cmd.note)
+                self.servo, self.rc = cmd.servo, cmd.rc
+                self.write_log(t, p, cmd)
+                if cmd.action == "done":
+                    break
+                if cmd.action == "hop":
                     drone.send_rc_control(0, 0, 0, 0)
-                    self.blocked = True
+                    self.phase, self.blocked = "HOP", True
                     self.sleep(0.4)
                     try:
-                        drone.go_xyz_speed(self.hop[0], self.hop[1], 0, HOP_SPEED)
+                        drone.go_xyz_speed(cmd.hop[0], cmd.hop[1], 0, self.cfg.hop_speed)
                     except Exception as e:
                         self.say(f"hop refused ({e}) - landing here")
-                    action = "land"
-                if action == "land":
-                    self.state, self.blocked = "LAND", True
+                if cmd.action in ("hop", "land"):
+                    self.phase, self.blocked = "LANDING", True
                     drone.send_rc_control(0, 0, 0, 0)
                     drone.land()
                     airborne, landed = False, True
-                    self.state = "LANDED"
-                else:
-                    drone.send_rc_control(*rc)
-                self.write_log(t, p, rc, self.battery)
+                    self.phase = "LANDED"
+                    break
+                drone.send_rc_control(*cmd.rc)
                 if self.view and not self.window():
                     airborne = False
-                    break
-                if action == "land":
                     break
                 self.sleep(max(0.0, 1.0 / RATE_HZ - (self.now() - t)))
             if landed:
@@ -480,7 +343,8 @@ class Lander:
             except Exception:
                 pass
             self.done.set()
-            display.join(timeout=2)
+            if display is not None:
+                display.join(timeout=2)
             if self.log:
                 self.logf.close()
             if self.video:
@@ -494,6 +358,7 @@ class Lander:
                     drone.end()
                 except Exception:
                     pass
+        self.reason = self.reason or m.reason
         self.say(f"ended: {self.reason or 'loop exited'}")
         return self.reason
 
@@ -513,22 +378,42 @@ class Lander:
             t_next += period
             time.sleep(max(0.0, t_next - time.monotonic()))
 
-    def write_log(self, t, p, rc, battery):
+    def write_log(self, t, p, cmd):
         if not self.log:
             return
 
+        def num(v, fmt=".1f"):
+            return "" if v is None or (isinstance(v, float) and math.isnan(v)) else format(v, fmt)
+
         def xyz(a):
             return ["", "", ""] if a is None else [f"{x:.1f}" for x in a]
+
         pose = self.pose if p is not None else None
-        self.log.writerow([f"{t - self.t0:.3f}", self.target, self.state, *xyz(p),
-                           *xyz(self.v if p is not None else None),
-                           "" if pose is None else f"{pose.yaw_deg:.1f}",
-                           "" if pose is None else int(pose.resolved),
-                           *rc, "" if battery is None else battery, self.note])
+        raw = self.raw
+        s = cmd.servo
+        st = self.telem
+        self.log.writerow([
+            f"{t - self.t0:.3f}", self.mission.target, self.state, *xyz(p),
+            *xyz(self.v if p is not None else None),
+            "" if pose is None else f"{pose.yaw_deg:.1f}",
+            "" if pose is None else int(pose.resolved),
+            "" if pose is None else pose.source,
+            "" if pose is None else f"{pose.ambiguity:.2f}",
+            "" if pose is None else f"{pose.reproj_rms_px:.2f}",
+            "" if pose is None else pose.n_markers,
+            *xyz(None if raw is None else raw.p_board_cm),
+            *(["", "", "", ""] if s is None else
+              [num(s.e_fwd), num(s.e_lat), num(s.e_up), num(s.e_yaw)]),
+            *cmd.rc,
+            *(["", ""] if cmd.hop is None else cmd.hop),
+            *(st.get(k, "") for k in ("bat", "h", "tof", "pitch", "roll", "yaw",
+                                      "vgx", "vgy", "vgz")),
+            self.note])
 
     def render(self):
         """Camera with the overlay, next to the map: 960x720 + MAP_SIZE."""
-        perc = self.perc[self.target]
+        target = self.mission.target
+        perc = self.perc[target]
         if self.blocked or self.frame is None:
             # the loop is waiting on the drone (takeoff, hop, land): show the
             # live picture without a stale pose on top
@@ -539,16 +424,16 @@ class Lander:
         if frame is None:
             frame = np.zeros((720, 960, 3), np.uint8)
         view = cv2.resize(perc.est.draw(frame, pose, *det), (960, 720))
-        name = "board" if self.target == "board" else f"marker {self.target}"
+        name = "board" if target == BOARD else f"marker {target}"
         lines = [f"{self.state} ({name})   rc {self.rc}   battery {self.battery}%"]
-        if self.err is not None and pose is not None and self.state not in ("SEARCH", "LAND"):
-            e = self.err
-            lines.append(f"error fwd {e['fwd']:+.0f} side {e['lat']:+.0f} up {e['up']:+.0f} cm"
-                         f"  yaw {e['yaw']:+.0f} deg")
-        for i, s in enumerate(reversed(lines)):
+        s = self.servo
+        if s is not None and pose is not None:
+            side = "?" if math.isnan(s.e_lat) else f"{s.e_lat:+.0f}"
+            lines.append(f"error fwd {s.e_fwd:+.0f} side {side} up {s.e_up:+.0f} cm"
+                         f"  yaw {s.e_yaw:+.0f} deg")
+        for i, line in enumerate(reversed(lines)):
             y = 720 - 14 - 24 * i
-            cv2.putText(view, s, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-            cv2.putText(view, s, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+            put_text(view, line, (12, y), 0.6, (0, 255, 255))
         p = perc.filt.position() if pose is not None else None
         yaw = pose.yaw_deg if pose is not None else 0.0
         side = perc.lmap.render(*MAP_SIZE, p, yaw, perc.trail, seen=pose is not None,
@@ -560,7 +445,7 @@ class Lander:
         if self.latest is not None:
             cv2.imshow("landing - q lands, x cuts motors", self.latest)
         k = cv2.waitKey(1) & 0xFF
-        if k in (ord("q"), 27) and self.state != "LANDED":
+        if k in (ord("q"), 27) and self.phase != "LANDED":
             self.say("stopped by hand - landing")
             self.reason = "stopped by hand"
             self.drone.send_rc_control(0, 0, 0, 0)
@@ -578,7 +463,12 @@ def main():
     ap = argparse.ArgumentParser(description="Visit waypoint markers, then find the "
                                              "ArUco board and land on the pad.")
     ap.add_argument("--waypoints", type=int, nargs="*", default=list(WAYPOINTS), metavar="ID",
-                    help="marker ids to visit first, in order (default: 4 5)")
+                    help="marker ids to visit first, in order (default: "
+                         f"{' '.join(map(str, WAYPOINTS))})")
+    ap.add_argument("--turns", nargs="*", default=[], metavar="R|L",
+                    help="which way to turn when searching for each target: one per "
+                         "waypoint marker, then one for the board (default: right for "
+                         "the markers, left for the board)")
     ap.add_argument("--marker-mm", type=float, default=150.0,
                     help="waypoint marker size, black edge to edge (default 150)")
     ap.add_argument("--view", action="store_true", help="show camera + map (q lands, x cuts motors)")
@@ -598,10 +488,14 @@ def main():
         ap.error(f"ids {bad} belong to the landing board - waypoints must be other markers")
     if len(set(args.waypoints)) != len(args.waypoints):
         ap.error("each waypoint marker can be visited once")
+    try:
+        turns = parse_turns(args.turns, args.waypoints)
+    except ValueError as e:
+        ap.error(f"--turns: {e}")
     K, dist, trusted = load_calibration(args.calib)
     if not trusted and not args.allow_bad_calib:
         raise SystemExit("refusing to fly on this calibration - run calibrate_camera.py")
-    Lander(open_drone(), K, dist, waypoints=args.waypoints, hold=args.hold,
+    Lander(open_drone(), K, dist, waypoints=args.waypoints, search_turn=turns, hold=args.hold,
            view=args.view, log=args.log, record=args.record, board=board,
            waypoint_marker_m=args.marker_mm / 1000).run()
 

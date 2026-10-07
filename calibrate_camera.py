@@ -236,7 +236,7 @@ def report(r):
             print(f"   - {p}")
     else:
         print("\nlooks good - validate with a tape measure before flying "
-              "(README step 4)")
+              "(README step 3)")
 
 
 def main():

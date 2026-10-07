@@ -2,7 +2,7 @@
 Live 3D view of the room map + drone pose, via rerun (pip install
 rerun-sdk - see requirements.txt). A debugging/visualization tool: it
 runs RoomLocalizer and shows where it thinks the camera is. It does not
-fly the drone - see README for why this stays standalone for now.
+fly the drone.
 
     python view_room_3d.py --live --map room_map.npz
     python view_room_3d.py --video walk.mp4 --map room_map.npz

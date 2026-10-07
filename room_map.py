@@ -9,9 +9,8 @@ right when facing it - same convention as BoardGeometry's board frame,
 because the root marker's local frame *is* the world frame.
 
 MOUNT THE ROOM MARKERS UPRIGHT. World +Y is taken to be vertical by
-everything that flies on this map (tello_aruco_landing.py's coarse leg
-splits position error into "horizontal" and "up" along it). A root
-marker mounted on its side tilts the whole room.
+everything that draws or flies on this map. A root marker mounted on its
+side tilts the whole room.
 
 ID SPACE: ids 0-3 are reserved for the landing board (BoardGeometry in
 tello_pose.py). Room markers must use ids 4+ from the same DICT_4X4_50
@@ -20,9 +19,9 @@ dictionary, so a single frame that happens to see both never collides.
 THE LANDING BOARD is stored separately from the markers, as one rigid
 body (board_R/board_t) rather than four independent markers, because its
 internal geometry is already pinned down by BoardGeometry. That pose is
-the bridge between this map and the landing controller: it is what lets
-tello_aruco_landing.py turn "the standoff point in board frame" into a
-room-frame waypoint it can fly to before the board is ever in view.
+the bridge between this map and the board frame the landing controller
+works in (board_to_world_cm / world_to_board_cm). The mission does not fly
+on the room map yet; the GUI draws and localizes with it.
 """
 
 from dataclasses import dataclass

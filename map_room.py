@@ -208,9 +208,9 @@ class RoomMapper:
 
         board_R, board_t = world.pop(BOARD_NODE, (None, None))
         if verbose and self.include_board and board_R is None:
-            print("!! the landing board is NOT in this map - "
-                  "tello_aruco_landing.py --room-map will refuse it. "
-                  "Re-walk with the board and a room marker in frame together.")
+            print("!! the landing board is NOT in this map - the 3D views cannot "
+                  "show the pad, and room localization cannot use the board's "
+                  "markers. Re-walk with the board and a room marker in frame together.")
         markers = {i: MarkerPose(i, self.marker_size_m, R, t)
                    for i, (R, t) in world.items()}
         return RoomMap(markers, board_R, board_t), root_id
@@ -277,8 +277,8 @@ def main():
     ap.add_argument("--out", default="room_map.npz")
     ap.add_argument("--view", action="store_true", help="show detections live")
     ap.add_argument("--no-board", action="store_true",
-                    help="ignore the landing board; the map will not be "
-                         "usable for tello_aruco_landing.py --room-map")
+                    help="ignore the landing board; the map will not "
+                         "place the board or the pad")
     args = ap.parse_args()
 
     if not args.live and not args.video:
@@ -302,7 +302,7 @@ def main():
           "while a new one comes into view. 'q' to stop and solve.")
     if not args.no_board:
         print("include the LANDING BOARD in at least one frame alongside a "
-              "room marker, or the map cannot drive the coarse approach.")
+              "room marker, or the map cannot place it.")
     for frame in frames:
         if frame is None:
             continue
@@ -328,7 +328,7 @@ def main():
     print(f"solved {len(room_map)} marker(s): {sorted(room_map.markers)}")
     if room_map.has_board:
         print(f"landing board at {np.round(room_map.board_t * 100, 1)} cm "
-              "in room frame - tello_aruco_landing.py --room-map can use this")
+              "in room frame")
     room_map.save(args.out)
     print(f"wrote {args.out}")
 

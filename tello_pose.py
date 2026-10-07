@@ -54,6 +54,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from tello_io import put_text
+
 # ----------------------------------------------------------------------
 # Board geometry - single source of truth, must match the printed sheet
 # ----------------------------------------------------------------------
@@ -229,8 +231,8 @@ def load_calibration(path="tello_calib.npz", quiet=False):
         print(f"!! {path} looks WRONG - do not fly on it:")
         for p in problems:
             print(f"   - {p}")
-        print("   Recalibrate: python calibrate_camera.py (see README, "
-              "'Calibration that works').")
+        print("   Recalibrate: python calibrate_camera.py (README step 2; "
+              "its docstring says what makes a calibration work).")
     return K, dist, not problems
 
 
@@ -569,10 +571,7 @@ class PoseEstimator:
         ]
         colour = (0, 255, 120) if pose.resolved else (0, 200, 255)
         for i, s in enumerate(lines):
-            cv2.putText(out, s, (12, 30 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.62, (0, 0, 0), 4)
-            cv2.putText(out, s, (12, 30 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.62, colour, 1)
+            put_text(out, s, (12, 30 + 26 * i), 0.62, colour)
         h, w = out.shape[:2]
         cv2.line(out, (w // 2, 0), (w // 2, h), (80, 80, 80), 1)
         return out

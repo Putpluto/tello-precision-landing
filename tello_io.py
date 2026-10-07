@@ -110,3 +110,23 @@ def file_frames(path, loop=False, stop=None):
 
 def black_frame(size=(960, 720)):
     return np.zeros((size[1], size[0], 3), np.uint8)
+
+
+_RING = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
+
+
+def put_text(img, s, org, scale, colour, thick=1, line_type=cv2.LINE_8,
+             outline=(0, 0, 0)):
+    """Text with a dark outline, readable over any picture.
+
+    The usual trick - the text in black at thickness 4, then in colour at
+    thickness 1 - only lines up while thickness leaves the glyphs' width
+    alone. OpenCV 5 draws thicker text wider (a 30-character line grows
+    ~7 px), so the black copy drifted off the coloured one and every
+    overlay read as a doubled smear. The outline here is the same thin
+    text, drawn one pixel off in each direction."""
+    x, y = org
+    for dx, dy in _RING:
+        cv2.putText(img, s, (x + dx, y + dy), cv2.FONT_HERSHEY_SIMPLEX, scale, outline,
+                    thick, line_type)
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thick, line_type)

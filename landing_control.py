@@ -4,15 +4,16 @@ Landing control: the mission state machine and the control law, no I/O.
 tello_aruco_landing.py owns the drone, the video, the log and the window;
 this module turns observations into commands. Nothing in here touches a
 socket, a window or the wall clock - time arrives inside each observation -
-so the whole mission can be stepped from a test with synthetic poses, and
-the same code flies the real Tello, the simulator, and the GUI's AUTO HOLD.
+so the whole mission can be stepped from a test with synthetic poses
+(tests/), and the same code flies the command line, the GUI's Mission tab
+and (ServoLaw on its own) the GUI's AUTO HOLD.
 
 FRAMES
 ------
-Level frame (L), see tello_pose.py: origin at the board centre, +X right
-as you face the print, +Y up, +Z out into the room, cm. The pad centre is
-at (0, -pad_drop, pad_out). The coarse leg (--room-map) runs the same law
-in the room map's frame, which is also +Y up.
+Level frame (L), see tello_pose.py: origin at the target's centre, +X right
+as you face the print, +Y up, +Z out into the room, cm. For the board the
+pad centre is at (0, -pad_drop, pad_out). Each waypoint marker is a target
+with its own L, origin at the marker's centre.
 
 rc channels, send_rc_control(a, b, c, d), each -100..100:
     a = right, b = forward, c = up, d = yaw clockwise
@@ -80,9 +81,9 @@ class Gains:
 
 def default_gains():
     """Tuned in the simulator (rc 100 ~ 1 m/s, 0.25 s video delay), with
-    margin: sim_eval.py varies the response by +-40% and the delay by
-    +-0.1 s and they still land. A real pass should start here, one axis
-    at a time (README, Tuning).
+    margin: the simulator varied the response by +-40% and the delay by
+    +-0.1 s and they still landed. A real pass should start here, one axis
+    at a time, with --log on to see what each change did.
 
     The integral terms matter when holding: a PD loop on a velocity-
     commanded drone settles wherever its correction balances a steady
@@ -285,22 +286,27 @@ def clamp_setpoint(sp, limits=SetpointLimits(), pad_drop=40.0):
 # Mission
 # ----------------------------------------------------------------------
 
+BOARD = "board"               # the last target of every route
+
+
 class State(Enum):
-    COARSE = "COARSE"         # room-map leg toward the standoff, board unseen
-    SEARCH = "SEARCH"         # yaw sweep until the board is seen
-    APPROACH = "APPROACH"     # servo to the FAR standoff
-    CLOSE = "CLOSE"           # servo to the NEAR standoff
+    SEARCH = "SEARCH"         # turn on the spot until the current target is seen
+    GOTO = "GOTO"             # waypoint marker: servo to the stop in front of it
+    HOVER = "HOVER"           # waypoint marker: hold there, then the next target
+    APPROACH = "APPROACH"     # board: servo to the FAR standoff
+    CLOSE = "CLOSE"           # board: servo to the NEAR standoff
     HOLD = "HOLD"             # --hold: stay at NEAR, no hop, no landing
     HOP = "HOP"               # one blind 'go' over the pad
-    LAND = "LAND"             # firmware 'land'
-    DONE = "DONE"
+    DONE = "DONE"             # the land (or hop-then-land) command has gone out
 
 
 @dataclass
 class MissionConfig:
     standoff_far: float = 150.0    # cm along +Z_L, approach hold
     standoff_near: float = 70.0    # cm, last hold before the hop
-    height: float = 0.0            # cm, target y in L (0 = level with board centre)
+    waypoint_standoff: float = 100.0   # cm in front of each waypoint marker...
+    waypoint_hover_s: float = 2.0  # ...held this long before the next target
+    height: float = 0.0            # cm, target y in L (0 = level with the target's centre)
     pad_out: float = 25.0          # cm, pad centre from the board, horizontally
     cam_fwd: float = 4.0           # cm, lens ahead of the airframe centre
     # settle: every error inside tolerance, speed low, for settle_s.
@@ -308,26 +314,23 @@ class MissionConfig:
     # range^4, see tello_pose.PoseFilter) - so it only has to be roughly
     # right. NEAR is where the hop is computed, and where the pose is ~20x
     # steadier.
-    tol_far: tuple = (15.0, 12.0, 15.0, 8.0, 20.0)   # fwd, lat, up cm; yaw deg; speed cm/s
+    tol_waypoint: tuple = (15.0, 12.0, 15.0, 8.0, 20.0)  # fwd, lat, up cm; yaw deg; speed cm/s
+    tol_far: tuple = (15.0, 12.0, 15.0, 8.0, 20.0)
     tol_near: tuple = (5.0, 3.5, 6.0, 4.0, 7.0)
     settle_s: float = 0.8
     relax_after_s: float = 12.0    # CLOSE only: widen tolerances after this long...
     relax_max: float = 1.6         # ...up to this factor, so wobble cannot stall it
+    goto_max_s: float = 40.0       # not settled at a waypoint marker: land where it is
     close_max_s: float = 40.0      # still not settled at NEAR: land where it is
-    lost_hover_s: float = 1.2      # board gone this long -> search (or coarse)
+    lost_hover_s: float = 1.2      # target gone this long -> search again
     search_rc: int = 22            # yaw sweep, rc units
     search_max_s: float = 25.0     # > one full turn at the default rate
-    mission_max_s: float = 120.0
+    mission_max_s: float = 120.0   # plus waypoint_extra_s per waypoint marker
+    waypoint_extra_s: float = 45.0
     batt_min: int = 15             # percent
     hop_speed: int = 30            # cm/s for the go command
     hop_max: float = 95.0          # refuse a hop longer than this, cm
-    coarse_tol: float = 30.0       # cm: at the waypoint, board still unseen -> SEARCH
-    coarse_max: float = 600.0      # cm: refuse a coarse dash longer than this
-    coarse_lost_s: float = 5.0     # room fix gone this long -> land
     hold: bool = False
-    # --hold with a setpoint: (x, y, z) cm in L to hold at instead of NEAR on
-    # the axis. Reached from FAR directly (CLOSE exists only for the hop).
-    hold_point: tuple = None
 
 
 REF_SPAN_M = 0.165          # the printed 2x2 board the defaults were tuned on
@@ -358,60 +361,71 @@ def for_board(geom, **cfg_kw):
 
 @dataclass
 class Obs:
-    """Everything the mission may use, at one control step."""
+    """Everything the mission may use, at one control step. p, v and pose
+    are of the CURRENT target (Mission.target), in that target's L."""
     t: float                       # now, seconds (any epoch)
     p: np.ndarray = None           # drone position in L, cm, filtered, predicted to t
     v: np.ndarray = None           # velocity in L, cm/s
     pose: object = None            # latest tello_pose.BoardPose (orientation, resolved)
-    room_p: np.ndarray = None      # position in the room frame, cm (coarse leg)
-    room_v: np.ndarray = None
-    room_R: np.ndarray = None      # camera axes in the room frame
     battery: float = None
 
 
 @dataclass
 class Cmd:
     rc: tuple = (0, 0, 0, 0)
-    action: str = None             # None | "hop" | "land" | "done"
+    action: str = None             # None | "hop" (go, then land) | "land" | "done"
     hop: tuple = None              # (forward_cm, left_cm) for go_xyz_speed
     note: str = ""                 # worth printing and logging when set
     servo: ServoOut = None
 
 
-class Mission:
-    """The landing sequence as a state machine. step(obs) -> Cmd; the
-    caller executes the command. See the module docstring for the law and
-    tello_aruco_landing.py for the loop that runs this."""
+def target_name(target):
+    return "the board" if target == BOARD else f"marker {target}"
 
-    def __init__(self, cfg=None, gains=None, room_waypoint=None):
-        """room_waypoint: (target_cm, aim_cm) in the room frame - the FAR
-        standoff and the board centre - to open with the coarse leg."""
+
+class Mission:
+    """The route as a state machine: each waypoint marker in turn
+    (SEARCH -> GOTO -> HOVER), then the board (SEARCH -> APPROACH -> CLOSE
+    -> HOP). step(obs) -> Cmd; the caller executes the command and feeds
+    back observations of `self.target`, which moves on as the route does.
+
+    search_turn: {target: +1 (right) or -1 (left)}, which way to turn on
+    the spot when searching for it. A full turn finds it either way; the
+    right direction only makes it quicker."""
+
+    def __init__(self, cfg=None, gains=None, waypoints=(), search_turn=None):
         self.cfg = cfg or MissionConfig()
         self.law = ServoLaw(gains)
-        self.room_law = ServoLaw(gains)
-        self.room_waypoint = room_waypoint
-        self.state = State.COARSE if room_waypoint is not None else State.SEARCH
+        self.targets = [int(w) for w in waypoints] + [BOARD]
+        self.search_turn = dict(search_turn or {})
+        self.max_s = self.cfg.mission_max_s + self.cfg.waypoint_extra_s * len(waypoints)
+        self.state = State.SEARCH
         self.t0 = None
         self.t_state = None
         self.t_seen = None
-        self.t_room = None
         self.t_settle = None
         self.t_prev = None
         self.dt = 1.0 / 15.0              # control period, for the integrals
-        self.search_dir = 1
-        self.last_note = ""
+        self.search_dir = self._turn_for(self.target)
         self.reason = ""
 
+    @property
+    def target(self):
+        """What to localize now: a waypoint marker id, or BOARD."""
+        return self.targets[0]
+
     # -- helpers ----------------------------------------------------------
+    def _turn_for(self, target):
+        return 1 if self.search_turn.get(target, 1) >= 0 else -1
+
     def _goto(self, state, t, note=""):
         self.state = state
         self.t_state = t
         self.t_settle = None
         self.law.reset()
-        self.room_law.reset()
         return note or f"-> {state.value}"
 
-    def _finish(self, t, why):
+    def abort(self, t, why):
         """Land where it is. The land action goes out with this command,
         so the machine goes straight to DONE."""
         self.reason = why
@@ -433,11 +447,22 @@ class Mission:
             self.t_settle = t
         return t - self.t_settle >= self.cfg.settle_s
 
+    def _next_target(self, t):
+        done = target_name(self.target)
+        self.targets.pop(0)
+        self.search_dir = self._turn_for(self.target)
+        side = "right" if self.search_dir > 0 else "left"
+        return Cmd(note=self._goto(State.SEARCH, t, f"{done} done -> turn {side}, "
+                                                    f"SEARCH for {target_name(self.target)}"))
+
     def hop_vector(self, p, R):
-        """Body-frame displacement from here to above the pad centre, cm.
-        The camera is ahead of the airframe centre, and the airframe
-        centre is what has to end up over the pad."""
+        """Body-frame displacement from here to above the pad centre, cm,
+        or None without a usable heading. The camera is ahead of the
+        airframe centre, and the airframe centre is what has to end up
+        over the pad."""
         fwd_h, right_h = horizontal_axes(R)
+        if fwd_h is None:
+            return None
         centre = np.asarray(p, float) - fwd_h * self.cfg.cam_fwd
         target = np.array([0.0, centre[1], self.cfg.pad_out])
         d = target - centre
@@ -448,137 +473,107 @@ class Mission:
         c = self.cfg
         t = obs.t
         if self.t0 is None:
-            self.t0 = self.t_state = t
+            self.t0 = self.t_state = self.t_seen = t
         if self.t_prev is not None:
             self.dt = min(max(t - self.t_prev, 0.01), 0.3)
         self.t_prev = t
-        st = self.state
-        if st is State.DONE:
+        if self.state is State.DONE:
             return Cmd(action="done")
-        if st is State.LAND:                         # after the hop
-            self.reason = self.reason or "landed after the hop"
-            self.state = State.DONE
-            return Cmd(action="land", note="land")
-
-        if t - self.t0 > c.mission_max_s:
-            return self._finish(t, f"mission timeout {c.mission_max_s:.0f} s")
+        if t - self.t0 > self.max_s:
+            return self.abort(t, f"mission timeout {self.max_s:.0f} s")
         if obs.battery is not None and obs.battery < c.batt_min:
-            return self._finish(t, f"battery {obs.battery}%")
+            return self.abort(t, f"battery {obs.battery}%")
 
         seen = obs.p is not None and obs.pose is not None
         if seen:
             self.t_seen = t
-        if obs.room_p is not None:
-            self.t_room = t
-
-        if st is State.COARSE:
-            return self._coarse(obs)
+        st = self.state
         if st is State.SEARCH:
             if seen:
-                return Cmd(note=self._goto(State.APPROACH, t, "board acquired -> APPROACH"))
+                nxt = State.APPROACH if self.target == BOARD else State.GOTO
+                return Cmd(note=self._goto(nxt, t, f"{target_name(self.target)} found "
+                                                   f"-> {nxt.value}"))
             if t - self.t_state > c.search_max_s:
-                return self._finish(t, "board not found")
+                return self.abort(t, f"{target_name(self.target)} not found")
             return Cmd(rc=(0, 0, 0, self.search_dir * c.search_rc))
-        if st in (State.APPROACH, State.CLOSE, State.HOLD):
-            return self._servo(obs, seen)
         if st is State.HOP:
-            if not seen:
-                return self._finish(t, "board lost before the hop - landing in place")
-            fwd, right = self.hop_vector(obs.p, obs.pose.R_level_cam)
-            side_note = ""
-            if not getattr(obs.pose, "resolved", True):
-                # Which side of the axis is unknown - but how far is not,
-                # and it settled inside tolerance - so straight ahead is
-                # never more than that far off. Guessing the side could
-                # double it.
-                side_note = f" (side unknown, |x| {abs(right):.0f} cm - straight)"
-                right = 0.0
-            if fwd < -5.0 or fwd > c.hop_max or abs(right) > 40.0:
-                return self._finish(t, f"hop ({fwd:.0f}, {right:.0f}) cm is not "
-                                       "plausible - landing in place")
-            self.t_state = t
-            if max(abs(fwd), abs(right)) < 20.0:
-                # 'go' refuses moves under 20 cm; this close, just land
-                self.state = State.DONE
-                self.reason = "landed (already over the pad)"
-                return Cmd(action="land", note=f"over the pad already "
-                                                f"({fwd:.0f}, {right:.0f}) cm - land")
-            self.state = State.LAND
-            return Cmd(action="hop", hop=(int(round(fwd)), int(round(-right))),
-                       note=f"HOP forward {fwd:.0f} right {right:.0f} cm{side_note}")
-        return Cmd()
+            return self._hop(obs, seen)
+        return self._servo(obs, seen)
 
     def _servo(self, obs, seen):
         c = self.cfg
         t = obs.t
         st = self.state
+        in_state = t - self.t_state
+        if st is State.HOVER and in_state >= c.waypoint_hover_s:
+            return self._next_target(t)
         if not seen:
-            lost = t - (self.t_seen if self.t_seen is not None else self.t_state)
-            if lost > c.lost_hover_s:
-                if self.room_waypoint is not None:
-                    return Cmd(note=self._goto(State.COARSE, t,
-                                               "board lost -> COARSE (back to the waypoint)"))
-                return Cmd(note=self._goto(State.SEARCH, t, "board lost -> SEARCH"))
-            return Cmd(rc=(0, 0, 0, 0))              # hover through a dropout
+            # a waypoint hover just runs out its time; anything else looks again
+            if st is not State.HOVER and t - self.t_seen > c.lost_hover_s:
+                return Cmd(note=self._goto(State.SEARCH, t, f"{target_name(self.target)} "
+                                                            "lost -> SEARCH"))
+            return Cmd()                             # hover through a dropout
 
-        if st is State.HOLD and c.hold_point is not None:
-            target = np.asarray(c.hold_point, float)
-        else:
-            standoff = c.standoff_far if st is State.APPROACH else c.standoff_near
-            target = np.array([0.0, c.height, standoff])
-        # nose on the board wherever the target is: that is what keeps the
-        # board in view from an off-axis setpoint
+        standoff = {State.GOTO: c.waypoint_standoff, State.HOVER: c.waypoint_standoff,
+                    State.APPROACH: c.standoff_far}.get(st, c.standoff_near)
+        target = np.array([0.0, c.height, standoff])
+        # Aim at the target's centre, not at the standoff: the standoff's
+        # bearing goes undefined exactly as you arrive, and arriving already
+        # pointed at the target keeps it in view for the next phase.
         aim = np.array([0.0, c.height, 0.0])
         resolved = bool(getattr(obs.pose, "resolved", True))
         out = self.law.step(obs.p, obs.v, obs.pose.R_level_cam, target, aim,
                             lateral=resolved, dt=self.dt)
         if out is None:
-            return Cmd(rc=(0, 0, 0, 0), note="no usable heading")
-        # remember which way to turn if the board is lost
+            return Cmd(note="no usable heading")
+        # remember which way to turn if the target is lost
         if abs(out.e_yaw) > 2.0:
             self.search_dir = 1 if out.e_yaw > 0 else -1
         cmd = Cmd(rc=out.rc, servo=out)
-        if st is State.APPROACH:
+        if st is State.GOTO:
+            if self._settled(out, c.tol_waypoint, t, resolved):
+                cmd.note = self._goto(State.HOVER, t, f"at {target_name(self.target)} -> "
+                                                      f"HOVER {c.waypoint_hover_s:.0f} s")
+            elif in_state > c.goto_max_s:
+                return self.abort(t, f"could not settle at {target_name(self.target)}")
+        elif st is State.APPROACH:
             if self._settled(out, c.tol_far, t, resolved):
-                if c.hold and c.hold_point is not None:
-                    x, y, z = c.hold_point
-                    cmd.note = self._goto(State.HOLD, t, "settled at FAR -> HOLD at "
-                                                         f"setpoint ({x:+.0f}, {y:+.0f}, {z:.0f}) cm")
-                else:
-                    cmd.note = self._goto(State.CLOSE, t, "settled at FAR -> CLOSE")
+                cmd.note = self._goto(State.CLOSE, t, "settled at FAR -> CLOSE")
         elif st is State.CLOSE:
-            in_state = t - self.t_state
             scale = 1.0 + min(max(in_state - c.relax_after_s, 0.0) / 10.0,
                               c.relax_max - 1.0)
             if self._settled(out, c.tol_near, t, resolved, scale):
-                if c.hold:
-                    cmd.note = self._goto(State.HOLD, t, "settled at NEAR -> HOLD (--hold)")
-                else:
-                    cmd.note = self._goto(State.HOP, t, "settled at NEAR -> HOP")
+                nxt = State.HOLD if c.hold else State.HOP
+                cmd.note = self._goto(nxt, t, f"settled at NEAR -> {nxt.value}")
             elif in_state > c.close_max_s:
-                return self._finish(t, "could not settle at NEAR - landing in place")
+                return self.abort(t, "could not settle at NEAR - landing in place")
         return cmd
 
-    def _coarse(self, obs):
+    def _hop(self, obs, seen):
         c = self.cfg
         t = obs.t
-        if obs.p is not None and obs.pose is not None:
-            # the precise sensor is available: hand over mid-flight
-            return Cmd(note=self._goto(State.APPROACH, t, "board acquired - COARSE -> APPROACH"))
-        if obs.room_p is None or obs.room_R is None:
-            last = self.t_room if self.t_room is not None else self.t_state
-            if t - last > c.coarse_lost_s:
-                return self._finish(t, "room localization lost")
-            return Cmd(rc=(0, 0, 0, 0))
-        target, aim = self.room_waypoint
-        out = self.room_law.step(obs.room_p, obs.room_v, obs.room_R, target, aim,
-                                 dt=self.dt)
-        if out is None:
-            return Cmd(rc=(0, 0, 0, 0), note="no usable heading")
-        if out.dist > c.coarse_max:
-            return self._finish(t, f"coarse waypoint {out.dist:.0f} cm away, over "
-                                   f"the {c.coarse_max:.0f} cm limit - check the room map")
-        if out.dist < c.coarse_tol:
-            return Cmd(note=self._goto(State.SEARCH, t, f"at the waypoint ({out.dist:.0f} cm) "
-                                                        "but no board in view -> SEARCH"))
-        return Cmd(rc=out.rc, servo=out)
+        if not seen:
+            return self.abort(t, "board lost just before the hop - landing in place")
+        hop = self.hop_vector(obs.p, obs.pose.R_level_cam)
+        if hop is None:
+            return self.abort(t, "no usable heading for the hop - landing in place")
+        fwd, right = hop
+        side_note = ""
+        if not getattr(obs.pose, "resolved", True):
+            # Which side of the axis is unknown - but how far is not, and it
+            # settled inside tolerance - so straight ahead is never more
+            # than that far off. Guessing the side could double it.
+            side_note = f" (side unknown, |x| {abs(right):.0f} cm - straight)"
+            right = 0.0
+        if not (-5.0 <= fwd <= c.hop_max and abs(right) <= 40.0):
+            return self.abort(t, f"hop ({fwd:.0f}, {right:.0f}) cm is not plausible "
+                                 "- landing in place")
+        self.state, self.t_state = State.DONE, t
+        if max(abs(fwd), abs(right)) < 20.0:
+            # 'go' refuses moves under 20 cm; this close, just land
+            self.reason = "landed (already over the pad)"
+            return Cmd(action="land", note=f"over the pad already ({fwd:.0f}, {right:.0f}) "
+                                           "cm - land")
+        self.reason = "landed on the pad"
+        return Cmd(action="hop", hop=(int(round(fwd)), int(round(-right))),
+                   note=f"HOP forward {fwd:.0f} cm, right {right:.0f} cm{side_note}")

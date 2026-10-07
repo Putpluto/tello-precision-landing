@@ -71,10 +71,10 @@ from map_room import RoomMapper
 from room_map import RoomMap
 from room_pose import RoomLocalizer
 from room_view import RoomView3D
-from tello_io import file_frames, open_drone, tello_frames
+from tello_io import file_frames, open_drone, put_text, tello_frames
 from tello_map import LocalizationMap
 from tello_pose import BoardTracker, PoseEstimator, PoseFilter, load_calibration
-from tello_aruco_landing import Lander
+from tello_aruco_landing import Lander, parse_turns
 
 try:
     from PIL import Image, ImageTk
@@ -124,7 +124,7 @@ class Recorder:
     PANEL = (MAP_W, MAP_H)         # the side panel, padded to one size
     COLS = ["t", "state", "tab", "px", "py", "pz", "yaw", "rms", "n", "source",
             "a", "b", "c", "d", "spx", "spy", "spz", "bat", "h", "tof",
-            "imu_yaw", "rx", "ry", "rz"]
+            "imu_yaw", "rx", "ry", "rz", "imu_pitch", "imu_roll", "vgx", "vgy", "vgz"]
 
     def __init__(self, folder="recordings", fps=20.0, with_panel=True, stem=None):
         import csv
@@ -204,9 +204,12 @@ class App:
         self.args = args
         self.live = args.live                 # a drone to fly
         self.geom = load_board()              # board.json (board_config.py) or the 2x2 board
-        cfg, self.sp_limits = for_board(self.geom)
-        self.standoff_far = args.standoff_far or cfg.standoff_far
-        self.standoff_near = args.standoff_near or cfg.standoff_near
+        # one config for AUTO HOLD's standoffs and the Mission tab's flight
+        kw = {k: v for k, v in (("standoff_far", args.standoff_far),
+                                ("standoff_near", args.standoff_near)) if v}
+        self.mission_cfg, self.sp_limits = for_board(self.geom, **kw)
+        self.standoff_far = self.mission_cfg.standoff_far
+        self.standoff_near = self.mission_cfg.standoff_near
         self.K, self.dist, self.real_calib = load_calibration(args.calib)
         self.cx = float(self.K[0, 2])
         self.est = PoseEstimator(self.K, self.dist, self.geom)
@@ -531,14 +534,23 @@ class App:
             messagebox.showerror("Mission", "Waypoints must be different markers, "
                                             f"not the board's ids {list(self.geom.ids)}")
             return
+        try:
+            turns = parse_turns(self.turns_var.get(), wps)
+        except ValueError as e:
+            messagebox.showerror("Mission", f"Search turns: {e}\n\nOne R or L per "
+                                            "waypoint marker, then one for the board - "
+                                            "or leave it empty for the defaults.")
+            return
         hold = bool(self.mission_hold_var.get())
-        route = " -> ".join([f"marker {w}" for w in wps] + ["board"])
-        ending = "HOLD 70 cm in front of the board (no hop, no landing)" if hold \
-            else "hop over the pad and LAND"
+        route = " -> ".join(f"{'board' if t == 'board' else f'marker {t}'} "
+                            f"({'right' if s > 0 else 'left'})" for t, s in turns.items())
+        ending = (f"HOLD {self.standoff_near:.0f} cm in front of the board (no hop, "
+                  "no landing)" if hold else "hop over the pad and LAND")
         if not messagebox.askyesno(
                 "Start mission?",
                 f"This flies the drone autonomously:\n\n"
-                f"{'' if self.airborne else 'take off, '}{route}, then {ending}.\n\n"
+                f"{'' if self.airborne else 'take off, '}search (turning) and visit "
+                f"{route}, then {ending}.\n\n"
                 "Stop mission (or ESC / L) lands at once; x cuts the motors.\n\nProceed?"):
             return
         self.set_mode("IDLE")
@@ -549,10 +561,11 @@ class App:
                        (time.strftime("%Y-%m-%d_%H-%M-%S") + "_mission"))
             rec, log = stem + ".mp4", stem + ".csv"
         stop = threading.Event()
-        lander = Lander(self.tello, self.K, self.dist, waypoints=wps, hold=hold,
-                        log=log, record=rec, on_note=self.log, stop=stop,
+        lander = Lander(self.tello, self.K, self.dist, waypoints=wps, search_turn=turns,
+                        hold=hold, log=log, record=rec, on_note=self.log, stop=stop,
                         disconnect=False, airborne=self.airborne, board=self.geom,
-                        waypoint_marker_m=self.args.marker_size)
+                        waypoint_marker_m=self.args.marker_size, cfg=self.mission_cfg,
+                        display=True)           # tick() shows lander.latest
         self.mission = (lander, stop)
         threading.Thread(target=self._run_mission, args=(lander,), daemon=True).start()
 
@@ -955,10 +968,7 @@ class App:
                 hud = f"{mode}  {task}  rc {rc}  {fps:4.1f} fps"
                 if self.downvision:
                     hud += "  [DOWN CAM]"
-                cv2.putText(view, hud, (12, view.shape[0] - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-                cv2.putText(view, hud, (12, view.shape[0] - 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                put_text(view, hud, (12, view.shape[0] - 14), 0.6, (0, 255, 255))
             self._full_view = view              # full size, for the recorder
             view = cv2.resize(view, (VIDEO_W, VIDEO_H))
 
@@ -1179,9 +1189,16 @@ class App:
         mrow.pack(anchor="w", pady=(6, 0))
         ttk.Label(mrow, text="waypoint markers, in order:").pack(side="left")
         self.wp_var = tk.StringVar(value=self.args.waypoints)
-        ttk.Entry(mrow, textvariable=self.wp_var, width=10).pack(side="left", padx=4)
+        ttk.Entry(mrow, textvariable=self.wp_var, width=12).pack(side="left", padx=4)
+        trow = ttk.Frame(ms)
+        trow.pack(anchor="w", pady=(2, 0))
+        ttk.Label(trow, text="search turns (R/L, board last):").pack(side="left")
+        self.turns_var = tk.StringVar(value=self.args.turns)
+        ttk.Entry(trow, textvariable=self.turns_var, width=12).pack(side="left", padx=4)
+        ttk.Label(trow, text="empty = R... then L", foreground="#888").pack(side="left")
         self.mission_hold_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ms, text="hold 70 cm from the board (no hop, no landing)",
+        ttk.Checkbutton(ms, text=f"hold {self.standoff_near:.0f} cm from the board "
+                                 "(no hop, no landing)",
                         variable=self.mission_hold_var).pack(anchor="w")
         self.mission_rec_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(ms, text="record video + log to recordings/",
@@ -1329,7 +1346,8 @@ class App:
                 "" if pose is None else pose.source,
                 *rc, *(f"{v:.1f}" for v in self.setpoint),
                 t.get("bat", ""), t.get("h", ""), t.get("tof", ""), t.get("yaw", ""),
-                *(f"{v:.1f}" for v in r)]
+                *(f"{v:.1f}" for v in r),
+                *(t.get(k, "") for k in ("pitch", "roll", "vgx", "vgy", "vgz"))]
 
     def _rec_step(self):
         try:
@@ -1579,8 +1597,11 @@ def main():
                          "the Room map tab's Save")
     ap.add_argument("--marker-size", type=float, default=0.15,
                     help="room / waypoint marker edge length, metres")
-    ap.add_argument("--waypoints", default="4 5",
+    ap.add_argument("--waypoints", default="4 5 6 7",
                     help="the Mission tab's waypoint markers to start with")
+    ap.add_argument("--turns", default="",
+                    help="the Mission tab's search turns, e.g. 'R R L R L' (one per "
+                         "waypoint marker, then the board); empty = the defaults")
     ap.add_argument("--standoff-far", type=float, default=None,
                     help="default: scaled to the target (board_config.py)")
     ap.add_argument("--standoff-near", type=float, default=None)

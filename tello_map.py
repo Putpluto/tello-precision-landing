@@ -41,6 +41,7 @@ import math
 import cv2
 import numpy as np
 
+from tello_io import put_text
 from tello_pose import BoardGeometry
 
 # BGR palette. Deliberately dim background so the coloured geometry reads
@@ -63,10 +64,7 @@ C_LIM    = (110, 64, 110)      # where a setpoint is allowed (dim magenta)
 
 
 def _text(img, s, org, color=C_TEXT, scale=0.40, thick=1):
-    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0),
-                thick + 2, cv2.LINE_AA)
-    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color,
-                thick, cv2.LINE_AA)
+    put_text(img, s, org, scale, color, thick, cv2.LINE_AA)
 
 
 def _dashed(img, p0, p1, color, thick=1, dash=8, gap=6):

@@ -4,8 +4,8 @@ Room-frame localization against a RoomMap built by map_room.py.
 Generalizes tello_pose.PoseEstimator's single-board solve to whichever
 subset of the room's mapped markers are visible in a frame. Pure
 perception, like tello_pose.py: image + RoomMap in, camera pose in the
-room's world frame out. Not wired into flight control - see README for
-why (visualization/debugging tool first).
+room's world frame out. Not wired into flight control: a visualization
+and debugging tool first.
 
 WHY TWO SOLVERS
 ---------------
@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 
 from room_map import RoomMap
+from tello_io import put_text
 from tello_pose import (BoardGeometry, detector_params, is_coplanar,
                         load_calibration, rotation_to_ypr, solve_general_pnp,
                         solve_planar_pnp)
@@ -162,10 +163,7 @@ class RoomLocalizer:
             f"ids {pose.ids}",
         ]
         for i, s in enumerate(lines):
-            cv2.putText(out, s, (12, 30 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.62, (0, 0, 0), 4)
-            cv2.putText(out, s, (12, 30 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.62, (120, 200, 255), 1)
+            put_text(out, s, (12, 30 + 26 * i), 0.62, (120, 200, 255))
         return out
 
 

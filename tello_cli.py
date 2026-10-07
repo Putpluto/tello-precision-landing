@@ -131,7 +131,7 @@ def keys_mode(sh, speed=30, pose=False):
     import cv2
     import numpy as np
 
-    from tello_io import FrameGrabber
+    from tello_io import FrameGrabber, put_text
 
     est = tracker = None
     if pose:
@@ -164,10 +164,7 @@ def keys_mode(sh, speed=30, pose=False):
                 view = est.draw(view, p, corners, ids)
             hud = f"rc a{a:+4d} b{b:+4d} c{c:+4d} d{d:+4d}  speed {speed}"
             h = view.shape[0]
-            cv2.putText(view, hud, (12, h - 18), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (0, 0, 0), 4)
-            cv2.putText(view, hud, (12, h - 18), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (255, 255, 0), 1)
+            put_text(view, hud, (12, h - 18), 0.6, (255, 255, 0))
             cv2.imshow("tello manual - ESC lands", view)
 
             k = cv2.waitKey(30) & 0xFF
