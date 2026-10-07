@@ -86,6 +86,10 @@ press **Start mission...** and confirm.
   overriding the mission's yaw; let go and the mission takes over again.
   On the command line (`--view` window) it is A / D or the arrow keys.
   (`NUDGE_RC`, `NUDGE_S` in `tello_aruco_landing.py`.)
+- **Skip marker (N):** gives up on the current marker (searching for it,
+  flying to it or hovering there) and searches for the next one, turning
+  the way set for it. The board can't be skipped. On the command line: N
+  in the `--view` window.
 - The drone stays connected afterwards. If you took off by hand first, the
   mission starts from the air.
 

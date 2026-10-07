@@ -95,6 +95,22 @@ def test_yaw_nudge_overrides_then_hands_back(capsys):
     assert after and any(y != -NUDGE_RC for y in after)
     assert "yaw nudge left (by hand)" in capsys.readouterr().out
 
+
+def test_skip_button_skips_a_marker_and_still_lands(capsys):
+    lander, drone, pad = make()
+    real_state = drone.get_current_state
+
+    def state():
+        if lander.mission.target == 5 and not lander.skip_req and                 "skipped" not in lander.note:
+            lander.skip_target()                  # skip marker 5 as soon as it's the target
+        return real_state()
+    drone.get_current_state = state
+    assert lander.run() == "landed on the pad"
+    out = capsys.readouterr().out
+    assert "marker 5 skipped by hand -> turn right, SEARCH for marker 6" in out
+    assert "at marker 5 -> HOVER" not in out
+    assert "at marker 4 -> HOVER" in out and "at marker 6 -> HOVER" in out
+
 def test_parse_turns():
     assert parse_turns("", ROUTE) == {4: 1, 5: 1, 6: 1, 7: 1, BOARD: -1}
     assert parse_turns("r,L r right LEFT", ROUTE) == {4: 1, 5: -1, 6: 1, 7: 1, BOARD: -1}

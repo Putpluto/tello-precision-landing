@@ -156,6 +156,19 @@ def test_close_enough_to_a_marker_moves_on_without_settling():
                      p=np.array([10.0, 0, 120]), **drifting))
     assert m.state is State.HOVER and "-> HOVER" in cmd.note
 
+
+def test_skip_by_hand_moves_to_the_next_target_but_not_past_the_board():
+    m = Mission(waypoints=(4, 5), search_turn={5: -1})
+    m.step(Obs(t=0.0, p=np.array([0.0, 0, 150]), v=np.zeros(3), pose=pose()))
+    assert m.state is State.GOTO and m.target == 4
+    cmd = m.skip(1.0)
+    assert m.state is State.SEARCH and m.target == 5
+    assert cmd.note == "marker 4 skipped by hand -> turn left, SEARCH for marker 5"
+    m.skip(2.0)
+    assert m.target == BOARD
+    cmd = m.skip(3.0)                                 # the board stays
+    assert m.target == BOARD and m.state is State.SEARCH and "nothing to skip" in cmd.note
+
 def test_losing_the_target_goes_back_to_search():
     m = Mission(waypoints=(4,))
     m.step(Obs(t=0.0, p=np.array([0.0, 0, 150]), v=np.zeros(3), pose=pose()))

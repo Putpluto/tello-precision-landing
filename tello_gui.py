@@ -552,7 +552,8 @@ class App:
                 f"{'' if self.airborne else 'take off, '}search (turning) and visit "
                 f"{route}, then {ending}.\n\n"
                 "Stop mission (or ESC / L) lands at once; x cuts the motors.\n"
-                "Q / E (or the arrow keys) nudge the yaw by hand.\n\nProceed?"):
+                "Q / E (or the arrow keys) nudge the yaw by hand; N skips the "
+                "current marker.\n\nProceed?"):
             return
         self.set_mode("IDLE")
         rec = log = None
@@ -593,6 +594,11 @@ class App:
         or the nudge buttons (held: keeps turning)."""
         if self.mission is not None:
             self.mission[0].nudge_yaw(direction)
+
+    def cmd_mission_skip(self):
+        """Give up on the current marker: search for the next target (N)."""
+        if self.mission is not None:
+            self.mission[0].skip_target()
 
     def cmd_mission_stop(self):
         if self.mission is not None:
@@ -902,6 +908,8 @@ class App:
                 self.cmd_mission_nudge(-1)  # yaw left by hand, while held
             elif k in ("e", "right"):
                 self.cmd_mission_nudge(+1)
+            elif k == "n":
+                self.cmd_mission_skip()
             return
         # The binding is on the root window, so it also sees keys typed into
         # the setpoint boxes and the --log field. Typing "run.csv" there
@@ -1227,6 +1235,8 @@ class App:
                   command=lambda: self.cmd_mission_nudge(-1)).pack(side="left", padx=(12, 2))
         tk.Button(mb, text="yaw (E) \u25b6", repeatdelay=250, repeatinterval=100,
                   command=lambda: self.cmd_mission_nudge(+1)).pack(side="left")
+        tk.Button(mb, text="Skip marker (N) \u23ed", command=self.cmd_mission_skip
+                  ).pack(side="left", padx=(12, 0))
         self.mission_var = tk.StringVar(value="")
         ttk.Label(ms, textvariable=self.mission_var, font=("Consolas", 9)
                   ).pack(anchor="w", pady=(4, 0))

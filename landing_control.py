@@ -474,12 +474,12 @@ class Mission:
             self.t_settle = t
         return t - self.t_settle >= c.waypoint_close_s
 
-    def _next_target(self, t):
+    def _next_target(self, t, how="done"):
         done = target_name(self.target)
         self.targets.pop(0)
         self.search_dir = self._turn_for(self.target)
         side = "right" if self.search_dir > 0 else "left"
-        return Cmd(note=self._goto(State.SEARCH, t, f"{done} done -> turn {side}, "
+        return Cmd(note=self._goto(State.SEARCH, t, f"{done} {how} -> turn {side}, "
                                                     f"SEARCH for {target_name(self.target)}"))
 
     def _sweep_dir(self, in_state):
@@ -490,6 +490,13 @@ class Mission:
         if in_state < s:
             return -1
         return 1 if int((in_state - s) // (2 * s)) % 2 == 0 else -1
+
+    def skip(self, t):
+        """By hand: give up on the current waypoint marker and search for the
+        next target. The board can't be skipped - it is where it lands."""
+        if self.target == BOARD or self.state is State.DONE:
+            return Cmd(note="skip: nothing to skip (the board is the last target)")
+        return self._next_target(t, how="skipped by hand")
 
     def hop_vector(self, p, R):
         """Body-frame displacement from here to above the pad centre, cm,

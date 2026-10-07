@@ -36,7 +36,8 @@ board is whatever board_config.py has configured (default: the 2x2 board).
 
 Keys (with --view): q = land now, x = cut the motors (the drone DROPS),
 a / d or the arrow keys = nudge the yaw left / right by hand (hold to keep
-turning; the mission takes over again when you let go).
+turning; the mission takes over again when you let go), n = skip the
+current marker and search for the next target.
 
 Safety: refuses to fly on a bad calibration, lands if the battery drops
 below 15%, if the mission runs too long, if a marker isn't found within a
@@ -205,6 +206,7 @@ class Lander:
         self.t0 = now()
         self.note = ""
         self.nudge = (0, 0.0)                # (direction, until): yaw override by hand
+        self.skip_req = False                # skip the current marker, by hand
         self.nudging = False
 
     @property
@@ -337,6 +339,9 @@ class Lander:
                     break
                 if self.stop is not None and self.stop.is_set():
                     cmd = m.abort(t, "stopped by hand")
+                elif self.skip_req:
+                    self.skip_req = False
+                    cmd = m.skip(t)
                 else:
                     cmd = m.step(obs)
                 if cmd.note:
@@ -484,6 +489,11 @@ class Lander:
         mission's yaw. Safe to call from another thread (the GUI)."""
         self.nudge = (1 if direction > 0 else -1, self.now() + NUDGE_S)
 
+    def skip_target(self):
+        """Skip the current waypoint marker at the next control step. Safe
+        to call from another thread (the GUI)."""
+        self.skip_req = True
+
     def apply_nudge(self, t, cmd):
         d, until = self.nudge
         active = bool(d) and t < until and cmd.action is None
@@ -496,13 +506,16 @@ class Lander:
     def window(self):
         """The --view window. False if the operator stopped the flight."""
         if self.latest is not None:
-            cv2.imshow("landing - q lands, x cuts motors, a/d nudge yaw", self.latest)
+            cv2.imshow("landing - q lands, x cuts motors, a/d nudge yaw, n skips marker",
+                       self.latest)
         kx = cv2.waitKeyEx(1)
         k = kx & 0xFF
         if k == ord("a") or kx in (2424832, 65361):      # a, left arrow
             self.nudge_yaw(-1)
         elif k == ord("d") or kx in (2555904, 65363):    # d, right arrow
             self.nudge_yaw(+1)
+        elif k == ord("n"):
+            self.skip_target()
         if k in (ord("q"), 27) and self.phase != "LANDED":
             self.say("stopped by hand - landing")
             self.reason = "stopped by hand"
