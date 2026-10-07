@@ -315,7 +315,13 @@ class MissionConfig:
     # range^4, see tello_pose.PoseFilter) - so it only has to be roughly
     # right. NEAR is where the hop is computed, and where the pose is ~20x
     # steadier.
-    tol_waypoint: tuple = (15.0, 12.0, 15.0, 8.0, 20.0)  # fwd, lat, up cm; yaw deg; speed cm/s
+    # A waypoint marker only has to be reached, not settled at: within
+    # waypoint_close_cm of the stop in front of it and pointing within
+    # waypoint_close_yaw of it, for waypoint_close_s -> HOVER, then on. (The
+    # full settle check sat 20 s at marker 4 on pose jitter alone.)
+    waypoint_close_cm: float = 30.0
+    waypoint_close_yaw: float = 15.0
+    waypoint_close_s: float = 0.3
     tol_far: tuple = (15.0, 12.0, 15.0, 8.0, 20.0)
     tol_near: tuple = (5.0, 3.5, 6.0, 4.0, 7.0)
     settle_s: float = 0.8
@@ -456,6 +462,18 @@ class Mission:
             self.t_settle = t
         return t - self.t_settle >= self.cfg.settle_s
 
+    def _close_enough(self, out, t):
+        """GOTO: near the stop in front of the marker and roughly facing it,
+        for waypoint_close_s. Speed is not checked: it moves on anyway."""
+        c = self.cfg
+        dist = math.sqrt(out.e_fwd ** 2 + out.e_lat_abs ** 2 + out.e_up ** 2)
+        if not (dist < c.waypoint_close_cm and abs(out.e_yaw) < c.waypoint_close_yaw):
+            self.t_settle = None
+            return False
+        if self.t_settle is None:
+            self.t_settle = t
+        return t - self.t_settle >= c.waypoint_close_s
+
     def _next_target(self, t):
         done = target_name(self.target)
         self.targets.pop(0)
@@ -560,7 +578,7 @@ class Mission:
             self.search_dir = 1 if out.e_yaw > 0 else -1
         cmd = Cmd(rc=out.rc, servo=out)
         if st is State.GOTO:
-            if self._settled(out, c.tol_waypoint, t, resolved):
+            if self._close_enough(out, t):
                 cmd.note = self._goto(State.HOVER, t, f"at {target_name(self.target)} -> "
                                                       f"HOVER {c.waypoint_hover_s:.0f} s")
             elif in_state > c.goto_max_s:

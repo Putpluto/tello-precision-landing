@@ -102,7 +102,7 @@ python tello_map.py --log flight.csv --video flight.mp4  # replay it afterwards
 takeoff
   for each waypoint (4, 5, 6, 7 in order):
     -> SEARCH    turn on the spot until that marker is seen
-    -> GOTO      fly to 100 cm in front of it, settle
+    -> GOTO      fly to 100 cm in front of it - within 30 cm and 15 deg is enough
     -> HOVER     hold there 2 s
   -> SEARCH    turn on the spot until the board is seen
   -> APPROACH  fly to 150 cm in front of the board, settle

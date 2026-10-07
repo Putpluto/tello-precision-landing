@@ -139,6 +139,23 @@ def test_hover_runs_out_then_searches_for_the_next_target():
     assert m.step(Obs(t=2.2)).rc[3] < 0
 
 
+
+def test_close_enough_to_a_marker_moves_on_without_settling():
+    """Within waypoint_close_cm and still drifting at 30 cm/s: that is
+    enough at a waypoint - HOVER after waypoint_close_s, no settle."""
+    m = Mission(waypoints=(4,))
+    drifting = dict(v=np.array([0.0, 0, 30]), pose=pose())
+    m.step(Obs(t=0.0, p=np.array([0.0, 0, 150]), **drifting))
+    assert m.state is State.GOTO
+    m.step(Obs(t=0.1, p=np.array([0.0, 0, 150]), **drifting))   # 50 cm off: not yet
+    m.step(Obs(t=0.5, p=np.array([0.0, 0, 150]), **drifting))
+    assert m.state is State.GOTO
+    m.step(Obs(t=0.6, p=np.array([10.0, 0, 120]), **drifting))  # ~22 cm off
+    assert m.state is State.GOTO
+    cmd = m.step(Obs(t=0.6 + MissionConfig.waypoint_close_s + 0.05,
+                     p=np.array([10.0, 0, 120]), **drifting))
+    assert m.state is State.HOVER and "-> HOVER" in cmd.note
+
 def test_losing_the_target_goes_back_to_search():
     m = Mission(waypoints=(4,))
     m.step(Obs(t=0.0, p=np.array([0.0, 0, 150]), v=np.zeros(3), pose=pose()))
