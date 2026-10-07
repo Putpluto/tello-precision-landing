@@ -1,0 +1,4 @@
+# Tested with Python 3.14, opencv-python 5.0, numpy 2.5, djitellopy 2.5.0.
+opencv-python>=4.7        # 4.7+ for the cv2.aruco.ArucoDetector API
+numpy>=1.24
+djitellopy==2.5.0         # hands out RGB frames - tello_pose.Frames converts
