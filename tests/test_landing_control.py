@@ -149,6 +149,31 @@ def test_losing_the_target_goes_back_to_search():
     assert m.state is State.SEARCH
 
 
+
+def test_losing_the_board_sweeps_left_then_right_not_a_full_turn():
+    m = Mission()
+    seen = dict(p=np.array([0.0, 0, 150]), v=np.zeros(3), pose=pose())
+    m.step(Obs(t=0.0, **seen))
+    assert m.state is State.APPROACH
+    m.step(Obs(t=1.5))
+    assert m.state is State.LOST                      # not SEARCH
+    yaw = {round(t, 1): m.step(Obs(t=1.5 + t)).rc[3] for t in (0.5, 1.9, 2.1, 5.9, 6.1, 9.9)}
+    assert yaw[0.5] < 0 and yaw[1.9] < 0               # left 2 s
+    assert yaw[2.1] > 0 and yaw[5.9] > 0               # right 4 s: back, then 2 s past
+    assert yaw[6.1] < 0 and yaw[9.9] < 0               # left again
+    cmd = m.step(Obs(t=12.0, **seen))
+    assert m.state is State.APPROACH and "found again" in cmd.note
+
+
+def test_board_not_back_after_the_sweeps_lands():
+    m = Mission()
+    m.step(Obs(t=0.0, p=np.array([0.0, 0, 150]), v=np.zeros(3), pose=pose()))
+    m.state, m.t_state = State.CLOSE, 0.0
+    m.step(Obs(t=1.5))
+    assert m.state is State.LOST and m.resume is State.CLOSE
+    cmd = m.step(Obs(t=1.5 + MissionConfig.lost_max_s + 0.1))
+    assert cmd.action == "land" and m.reason == "board lost"
+
 @pytest.mark.parametrize("obs, why", [
     (Obs(t=0.0, battery=10), "battery 10%"),
     (Obs(t=301.0), "mission timeout 300 s"),

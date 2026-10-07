@@ -111,6 +111,12 @@ It lands by itself if the battery drops below 15%, after 2 minutes (plus
 found within one full turn, if it can't settle, or if the hop it computes
 looks wrong. There is no obstacle sensing: keep the paths clear.
 
+If it loses the board after finding it (APPROACH, CLOSE or HOLD), it does
+not turn a full circle. It enters LOST and looks either side of where the
+board was: left 2 s, right 4 s (back, then 2 s past), left 2 s back, and
+again. When it sees the board it carries on where it was. Not back after
+16 s: it lands. (`lost_sweep_s`, `lost_max_s` in `MissionConfig`.)
+
 Settings: the route (waypoints, search turns) is at the top of
 `tello_aruco_landing.py`; how it is flown (distances, hover time,
 tolerances, timeouts) is `MissionConfig` and the gains are `default_gains()`,

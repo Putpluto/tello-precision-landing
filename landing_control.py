@@ -291,6 +291,7 @@ BOARD = "board"               # the last target of every route
 
 class State(Enum):
     SEARCH = "SEARCH"         # turn on the spot until the current target is seen
+    LOST = "LOST"             # board lost: sweep left / right around where it was
     GOTO = "GOTO"             # waypoint marker: servo to the stop in front of it
     HOVER = "HOVER"           # waypoint marker: hold there, then the next target
     APPROACH = "APPROACH"     # board: servo to the FAR standoff
@@ -325,6 +326,13 @@ class MissionConfig:
     lost_hover_s: float = 1.2      # target gone this long -> search again
     search_rc: int = 22            # yaw sweep, rc units
     search_max_s: float = 25.0     # > one full turn at the default rate
+    # Board lost after it was found (APPROACH / CLOSE / HOLD): no full turn,
+    # just look either side of where it was. Left lost_sweep_s, right
+    # 2 x lost_sweep_s (back past the start, lost_sweep_s to the right),
+    # left lost_sweep_s back to the start, and again. Not back by
+    # lost_max_s (two such sweeps): land where it is.
+    lost_sweep_s: float = 2.0
+    lost_max_s: float = 16.0
     mission_max_s: float = 120.0   # plus waypoint_extra_s per waypoint marker
     waypoint_extra_s: float = 45.0
     batt_min: int = 15             # percent
@@ -407,6 +415,7 @@ class Mission:
         self.t_prev = None
         self.dt = 1.0 / 15.0              # control period, for the integrals
         self.search_dir = self._turn_for(self.target)
+        self.resume = None                # the state LOST goes back to
         self.reason = ""
 
     @property
@@ -455,6 +464,15 @@ class Mission:
         return Cmd(note=self._goto(State.SEARCH, t, f"{done} done -> turn {side}, "
                                                     f"SEARCH for {target_name(self.target)}"))
 
+    def _sweep_dir(self, in_state):
+        """LOST: -1 (left) for lost_sweep_s, then +1 / -1 alternating every
+        2 x lost_sweep_s, so the heading swings +-lost_sweep_s of turning
+        around where the board was lost."""
+        s = self.cfg.lost_sweep_s
+        if in_state < s:
+            return -1
+        return 1 if int((in_state - s) // (2 * s)) % 2 == 0 else -1
+
     def hop_vector(self, p, R):
         """Body-frame displacement from here to above the pad centre, cm,
         or None without a usable heading. The camera is ahead of the
@@ -496,6 +514,13 @@ class Mission:
             if t - self.t_state > c.search_max_s:
                 return self.abort(t, f"{target_name(self.target)} not found")
             return Cmd(rc=(0, 0, 0, self.search_dir * c.search_rc))
+        if st is State.LOST:
+            if seen:
+                return Cmd(note=self._goto(self.resume, t, f"board found again "
+                                                           f"-> {self.resume.value}"))
+            if t - self.t_state > c.lost_max_s:
+                return self.abort(t, "board lost")
+            return Cmd(rc=(0, 0, 0, self._sweep_dir(t - self.t_state) * c.search_rc))
         if st is State.HOP:
             return self._hop(obs, seen)
         return self._servo(obs, seen)
@@ -510,6 +535,10 @@ class Mission:
         if not seen:
             # a waypoint hover just runs out its time; anything else looks again
             if st is not State.HOVER and t - self.t_seen > c.lost_hover_s:
+                if self.target == BOARD:
+                    self.resume = st
+                    return Cmd(note=self._goto(State.LOST, t, "board lost -> LOST: look "
+                                               f"left {c.lost_sweep_s:.0f} s, then right"))
                 return Cmd(note=self._goto(State.SEARCH, t, f"{target_name(self.target)} "
                                                             "lost -> SEARCH"))
             return Cmd()                             # hover through a dropout
