@@ -551,7 +551,8 @@ class App:
                 f"This flies the drone autonomously:\n\n"
                 f"{'' if self.airborne else 'take off, '}search (turning) and visit "
                 f"{route}, then {ending}.\n\n"
-                "Stop mission (or ESC / L) lands at once; x cuts the motors.\n\nProceed?"):
+                "Stop mission (or ESC / L) lands at once; x cuts the motors.\n"
+                "Q / E (or the arrow keys) nudge the yaw by hand.\n\nProceed?"):
             return
         self.set_mode("IDLE")
         rec = log = None
@@ -586,6 +587,12 @@ class App:
             self.pf.reset()
             self._last_send = time.time()
             self.mission = None
+
+    def cmd_mission_nudge(self, direction):
+        """Override the mission's yaw for a moment: Q / E, the arrow keys
+        or the nudge buttons (held: keeps turning)."""
+        if self.mission is not None:
+            self.mission[0].nudge_yaw(direction)
 
     def cmd_mission_stop(self):
         if self.mission is not None:
@@ -891,6 +898,10 @@ class App:
                 self.cmd_land()             # = stop the mission, it lands
             elif k == "x":
                 self.cmd_emergency()
+            elif k in ("q", "left"):
+                self.cmd_mission_nudge(-1)  # yaw left by hand, while held
+            elif k in ("e", "right"):
+                self.cmd_mission_nudge(+1)
             return
         # The binding is on the root window, so it also sees keys typed into
         # the setpoint boxes and the --log field. Typing "run.csv" there
@@ -1211,6 +1222,11 @@ class App:
         tk.Button(mb, text="Stop mission (land)", bg="#a11", fg="white",
                   activebackground="#d22", command=self.cmd_mission_stop
                   ).pack(side="left")
+        # hold to keep turning (the button repeats); Q / E or the arrows do the same
+        tk.Button(mb, text="\u25c0 yaw (Q)", repeatdelay=250, repeatinterval=100,
+                  command=lambda: self.cmd_mission_nudge(-1)).pack(side="left", padx=(12, 2))
+        tk.Button(mb, text="yaw (E) \u25b6", repeatdelay=250, repeatinterval=100,
+                  command=lambda: self.cmd_mission_nudge(+1)).pack(side="left")
         self.mission_var = tk.StringVar(value="")
         ttk.Label(ms, textvariable=self.mission_var, font=("Consolas", 9)
                   ).pack(anchor="w", pady=(4, 0))

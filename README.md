@@ -81,6 +81,11 @@ press **Start mission...** and confirm.
 - With "record video + log" ticked, it saves `recordings/<time>_mission.mp4`
   and `.csv`. The recording includes the hop, the landing and 5 s after it.
 - **Stop mission** (or ESC / L) lands at once. x cuts the motors (the drone drops).
+- **Nudge the yaw by hand:** Q / E, the arrow keys, or the ◀ yaw / yaw ▶
+  buttons (hold to keep turning). Each press turns at rc 25 for 0.4 s,
+  overriding the mission's yaw; let go and the mission takes over again.
+  On the command line (`--view` window) it is A / D or the arrow keys.
+  (`NUDGE_RC`, `NUDGE_S` in `tello_aruco_landing.py`.)
 - The drone stays connected afterwards. If you took off by hand first, the
   mission starts from the air.
 

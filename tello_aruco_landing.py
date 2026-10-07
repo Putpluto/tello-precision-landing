@@ -34,7 +34,9 @@ poses of the target (PoseEstimator), the real one picked by BoardTracker
 (image fit, gravity, IMU heading), smoothed by PoseFilter (Kalman). The
 board is whatever board_config.py has configured (default: the 2x2 board).
 
-Keys (with --view): q = land now, x = cut the motors (the drone DROPS).
+Keys (with --view): q = land now, x = cut the motors (the drone DROPS),
+a / d or the arrow keys = nudge the yaw left / right by hand (hold to keep
+turning; the mission takes over again when you let go).
 
 Safety: refuses to fly on a bad calibration, lands if the battery drops
 below 15%, if the mission runs too long, if a marker isn't found within a
@@ -53,7 +55,7 @@ import cv2
 import numpy as np
 
 from board_config import load_board
-from landing_control import BOARD, Mission, Obs, for_board, target_name
+from landing_control import BOARD, Cmd, Mission, Obs, for_board, target_name
 from tello_io import FrameGrabber, open_drone, put_text
 from tello_map import LocalizationMap
 from tello_pose import (BoardGeometry, BoardTracker, PoseEstimator, PoseFilter,
@@ -76,6 +78,10 @@ WAYPOINT_MARKER_M = 0.150   # print/room_marker_*_A4.pdf
 # time, tolerances, timeouts, gains) is landing_control.MissionConfig.
 RATE_HZ = 15.0
 VIDEO_DELAY_S = 0.25        # the video lags; positions are predicted across it
+# Yaw nudge by hand: each key press (or GUI button) overrides the mission's
+# yaw command with this rate for NUDGE_S; holding the key keeps it going.
+NUDGE_RC = 25
+NUDGE_S = 0.4
 AFTER_LAND_S = 5.0          # keep recording this long after touching down
 MAP_SIZE = (564, 720)       # the map beside the 960x720 camera view
 
@@ -86,7 +92,12 @@ LOG_COLS = ["t", "target", "state", "px", "py", "pz", "vx", "vy", "vz",
             "raw_x", "raw_y", "raw_z", "e_fwd", "e_lat", "e_up", "e_yaw",
             "a", "b", "c", "d", "hop_fwd", "hop_left",
             "bat", "h", "tof", "imu_pitch", "imu_roll", "imu_yaw", "vgx", "vgy", "vgz",
-            "note"]
+            "templ", "temph", "note"]
+
+# The Tello lands by itself on a sagging battery or when it overheats.
+# Height 0 and the downward sensor at its 10 cm floor this long: it is
+# on the ground, so stop the mission instead of "searching" there.
+GROUND_S = 1.0
 
 
 def parse_turns(turns, waypoints):
@@ -193,6 +204,8 @@ class Lander:
         self.warned_upside_down = set()
         self.t0 = now()
         self.note = ""
+        self.nudge = (0, 0.0)                # (direction, until): yaw override by hand
+        self.nudging = False
 
     @property
     def target(self):
@@ -220,6 +233,21 @@ class Lander:
         self.telem = st
         self.battery = st.get("bat", self.battery)
         self.imu_yaw = st.get("yaw")
+
+    def on_ground(self, t):
+        """True once the state packet has said "on the ground" (height 0,
+        downward range at its 10 cm floor) for GROUND_S."""
+        try:
+            down = (float(self.telem.get("h", 99)) <= 0
+                    and float(self.telem.get("tof", 999)) <= 10)
+        except (TypeError, ValueError):
+            down = False
+        if not down:
+            self.t_ground = None
+            return False
+        if self.t_ground is None:
+            self.t_ground = t
+        return t - self.t_ground >= GROUND_S
 
     def observe(self, now):
         """New frame -> pose of the mission's current target -> track.
@@ -261,7 +289,7 @@ class Lander:
     def run(self):
         drone, m = self.drone, self.mission
         self.t0 = self.now()
-        self.imu_yaw = None
+        self.imu_yaw, self.telem, self.t_ground = None, {}, None
         self.rc, self.battery = (0, 0, 0, 0), drone.get_battery()
         self.say(f"battery {self.battery}%   route: " + " -> ".join(
             f"{target_name(t)} ({'R' if m.search_turn.get(t, 1) > 0 else 'L'})"
@@ -297,12 +325,23 @@ class Lander:
                 p = self.observe(t)
                 obs = Obs(t=t, p=p, v=self.v, pose=self.pose if p is not None else None,
                           battery=self.battery)
+                if self.on_ground(t):
+                    st = self.telem
+                    m.abort(t, "the drone landed by itself")
+                    self.say(f"!! THE DRONE LANDED BY ITSELF (battery {self.battery}%, "
+                             f"temperature {st.get('templ', '?')}-{st.get('temph', '?')} C). "
+                             "The Tello does this on a weak battery or when it overheats.")
+                    self.write_log(t, p, Cmd(note="landed by itself"))
+                    airborne, landed = False, True
+                    self.phase = "LANDED"
+                    break
                 if self.stop is not None and self.stop.is_set():
                     cmd = m.abort(t, "stopped by hand")
                 else:
                     cmd = m.step(obs)
                 if cmd.note:
                     self.say(cmd.note)
+                self.apply_nudge(t, cmd)
                 self.servo, self.rc = cmd.servo, cmd.rc
                 self.write_log(t, p, cmd)
                 if cmd.action == "done":
@@ -407,7 +446,7 @@ class Lander:
             *cmd.rc,
             *(["", ""] if cmd.hop is None else cmd.hop),
             *(st.get(k, "") for k in ("bat", "h", "tof", "pitch", "roll", "yaw",
-                                      "vgx", "vgy", "vgz")),
+                                      "vgx", "vgy", "vgz", "templ", "temph")),
             self.note])
 
     def render(self):
@@ -440,11 +479,30 @@ class Lander:
                                 hud=perc.lmap.hud_lines(p, yaw, f"{self.state}  {name}"))
         return np.hstack([view, side])
 
+    def nudge_yaw(self, direction):
+        """Turn left (-1) or right (+1) by hand for NUDGE_S, overriding the
+        mission's yaw. Safe to call from another thread (the GUI)."""
+        self.nudge = (1 if direction > 0 else -1, self.now() + NUDGE_S)
+
+    def apply_nudge(self, t, cmd):
+        d, until = self.nudge
+        active = bool(d) and t < until and cmd.action is None
+        if active:
+            cmd.rc = (*cmd.rc[:3], d * NUDGE_RC)
+            if not self.nudging:
+                self.say(f"yaw nudge {'right' if d > 0 else 'left'} (by hand)")
+        self.nudging = active
+
     def window(self):
         """The --view window. False if the operator stopped the flight."""
         if self.latest is not None:
-            cv2.imshow("landing - q lands, x cuts motors", self.latest)
-        k = cv2.waitKey(1) & 0xFF
+            cv2.imshow("landing - q lands, x cuts motors, a/d nudge yaw", self.latest)
+        kx = cv2.waitKeyEx(1)
+        k = kx & 0xFF
+        if k == ord("a") or kx in (2424832, 65361):      # a, left arrow
+            self.nudge_yaw(-1)
+        elif k == ord("d") or kx in (2555904, 65363):    # d, right arrow
+            self.nudge_yaw(+1)
         if k in (ord("q"), 27) and self.phase != "LANDED":
             self.say("stopped by hand - landing")
             self.reason = "stopped by hand"
